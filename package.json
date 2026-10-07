@@ -1,0 +1,42 @@
+{
+  "name": "asmo-tag",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A shared Telegram teammate from Asmo AI",
+  "engines": {
+    "node": ">=22.22"
+  },
+  "packageManager": "pnpm@12.9.1",
+  "scripts": {
+    "dev": "tsx src/main.ts serve",
+    "demo": "tsx src/main.ts demo",
+    "db:migrate": "tsx src/main.ts migrate",
+    "db:local": "tsx scripts/local-db.ts",
+    "db:stop": "tsx scripts/local-db.ts stop",
+    "web:dev": "vite --config web/vite.config.ts",
+    "web:build": "vite build --config web/vite.config.ts",
+    "web:check": "tsc -p web/tsconfig.json",
+    "check": "tsc --noEmit",
+    "test": "vitest run",
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "0.131.0",
+    "abort-controller": "3.0.0",
+    "grammy": "1.46.0",
+    "openai": "7.28.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2",
+    "vite": "8.3.2",
+    "vitest": "5.0.3"
+  }
+}

@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Asmo Tag Mini App variants A, B, and C</title>
+<style>
+:root{color-scheme:dark;font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#000;color:#fff;line-height:1.4;font-size:14px}
+*{box-sizing:border-box}body{margin:0;background:#000}a{color:#fff;text-underline-offset:4px}button{font:inherit}button:disabled{opacity:1;color:#fff;cursor:default}h1,h2,h3,p{margin:0}h1{font-size:22px;font-weight:600;letter-spacing:-.5px}h2{font-size:18px;font-weight:600;letter-spacing:-.3px}h3{font-size:14px;font-weight:600}table{width:100%;border-collapse:collapse}td,th{text-align:left;font-weight:400;padding:9px 0;border-bottom:1px solid #252525;vertical-align:top}th{color:#a4a4a4;font-size:11px;letter-spacing:.03em}td+td,th+th{padding-left:12px}code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}.quiet{color:#aaa}.small{font-size:12px}.tiny{font-size:11px}.page-head{padding:24px 28px 20px;border-bottom:1px solid #303030;display:flex;gap:24px;align-items:flex-start;justify-content:space-between}.page-head p{margin-top:6px;max-width:780px}.jump{display:flex;gap:16px;white-space:nowrap;font-size:12px;padding-top:5px}.compare{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));max-width:1600px;margin:0 auto}.variant{min-width:0;border-right:1px solid #303030;padding:22px 24px 30px}.variant:last-child{border-right:0}.variant-title{display:flex;align-items:baseline;gap:12px;margin-bottom:8px}.letter{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:24px;font-weight:600}.intent{font-size:12px;color:#aaa;min-height:36px;margin-bottom:22px}.screen{border-top:1px solid #444;padding-top:14px;min-height:880px}.app-head{display:flex;justify-content:space-between;align-items:center;padding-bottom:16px;border-bottom:1px solid #303030}.brand{font-size:19px;font-weight:650;letter-spacing:-.6px}.nav{display:flex;gap:16px;font-size:12px;padding:14px 0;border-bottom:1px solid #303030;flex-wrap:wrap}.nav span{color:#aaa}.nav .active{color:#fff;text-decoration:underline;text-underline-offset:7px}.section{padding-top:20px}.section-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:9px;gap:12px}.rule{border-bottom:1px solid #303030;padding:12px 0}.row{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}.row-main{min-width:0}.row-main p{margin-top:4px}.state{font-size:11px;white-space:nowrap;color:#bbb}.task-id{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;color:#aaa;display:block;margin-bottom:4px}.controls{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}.action{background:#000;border:1px solid #666;border-radius:0;padding:7px 12px;font-size:12px}.action.primary{background:#fff;color:#000;border-color:#fff;font-weight:600}.action.text{padding:7px 3px;border-color:transparent;text-decoration:underline;text-underline-offset:4px}.approval{margin-top:20px;padding:16px 0;border-top:2px solid #fff;border-bottom:1px solid #444}.approval h3{font-size:15px;margin-bottom:10px}.preview-title{font-size:15px;line-height:1.3;margin-top:12px}.preview-content{margin-top:9px;padding-left:12px;border-left:1px solid #555}.preview-content p+p{margin-top:8px}.keyline{display:flex;justify-content:space-between;padding:8px 0;gap:12px;font-size:12px;border-bottom:1px solid #222}.number{font-variant-numeric:tabular-nums;white-space:nowrap}.metric-pair{display:flex;gap:26px;padding:13px 0;border-bottom:1px solid #303030}.metric-pair b{display:block;font-size:21px;font-weight:500;letter-spacing:-.5px;margin-bottom:3px}.notes{padding:13px 0;color:#aaa;font-size:11px}.bottom{display:flex;justify-content:space-between;font-size:11px;padding-top:18px;margin-top:22px;border-top:1px solid #303030;color:#aaa;gap:10px}.b-screen .app-head{border-bottom:0;padding-bottom:8px}.b-context{font-size:11px;padding-bottom:14px;border-bottom:1px solid #444}.b-title{font-size:27px;font-weight:500;line-height:1.12;letter-spacing:-.8px;margin-top:17px}.b-status{display:flex;justify-content:space-between;padding:12px 0;border-bottom:1px solid #444;font-size:12px;gap:12px}.event{display:grid;grid-template-columns:46px minmax(0,1fr);gap:12px;padding:15px 0;border-bottom:1px solid #222}.event-time{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;color:#aaa;padding-top:2px}.event h3{margin-bottom:6px}.evidence{font-size:11px;color:#aaa;margin-top:8px;display:flex;gap:10px;flex-wrap:wrap}.b-fact{padding:12px 0;border-bottom:1px solid #303030}.b-fact p{margin-top:5px}.b-approval{margin-top:16px;padding:15px 0;border-top:1px solid #fff;border-bottom:1px solid #444}.b-approval h3{font-size:17px;margin-bottom:9px}.split-meta{display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:12px 0;font-size:11px;border-bottom:1px solid #303030}.split-meta span{display:block;color:#aaa;margin-bottom:3px}.c-screen{font-size:12px}.c-workspace{padding:14px 0;border-bottom:1px solid #303030}.c-workspace h2{font-size:24px;font-weight:500;letter-spacing:-.7px;margin-bottom:4px}.c-screen .section-head h3{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;text-transform:uppercase;letter-spacing:.08em}.count{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;color:#aaa}.c-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0;padding:12px 0;border-bottom:1px solid #303030}.c-grid>div{padding:5px 0}.c-grid b{font:24px ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:400;display:block;margin-bottom:4px}.config-row{display:grid;grid-template-columns:105px minmax(0,1fr);gap:12px;padding:10px 0;border-bottom:1px solid #222}.label{color:#aaa}.denial{padding:12px 0;border-top:1px solid #777;border-bottom:1px solid #303030;margin-top:18px}.denial p{margin-top:5px;color:#aaa}.page-footer{border-top:1px solid #303030;padding:22px 28px;max-width:1600px;margin:0 auto;font-size:12px}.page-footer p+p{margin-top:8px}
+@media(max-width:1100px){.variant{padding:20px 16px}.page-head{padding:20px}.nav{gap:11px}.compare{grid-template-columns:repeat(2,minmax(0,1fr))}.variant:nth-child(2){border-right:0}.variant:nth-child(3){grid-column:1/-1;border-top:1px solid #303030;max-width:640px;width:100%;margin:0 auto}.screen{min-height:0}.intent{min-height:0}}
+@media(max-width:650px){.page-head{display:block;padding:18px 16px}.jump{margin-top:14px}.compare{display:block}.variant{border-right:0;border-bottom:1px solid #303030;padding:20px 16px 28px}.variant:nth-child(3){border-top:0}.page-footer{padding:18px 16px}.variant-title{margin-bottom:6px}.intent{margin-bottom:16px}.screen{min-height:0}.metric-pair{gap:32px}.b-title{font-size:26px}}
+@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto}}
+</style>
+</head>
+<body>
+<header class="page-head">
+<div><h1>Asmo Tag Mini App. Pick A, B, or C.</h1><p class="small quiet">Static pilot design proposals for Asmo Tag under Asmo AI. All names, tasks, sources, and amounts below are invented demo data. Controls do not execute actions.</p></div>
+<nav class="jump" aria-label="Variants"><a href="#variant-a">A. Task desk</a><a href="#variant-b">B. Investigation</a><a href="#variant-c">C. Control room</a></nav>
+</header>
+<main class="compare">
+<section class="variant" id="variant-a" aria-labelledby="heading-a">
+<div class="variant-title"><span class="letter">A</span><h2 id="heading-a">Task desk</h2></div>
+<p class="intent">A shared inbox with the next decision in view. Best for teammates managing several jobs.</p>
+<div class="screen a-screen">
+<header class="app-head"><span class="brand">asmo tag</span><span class="small">Atlas team <span class="quiet"> / Engineering</span></span></header>
+<div class="nav" aria-label="Proposed navigation"><span class="active">Tasks</span><span>Memory</span><span>Routines</span><span>Settings</span></div>
+<section class="section">
+<div class="section-head"><h3>Needs a decision</h3><span class="small quiet">1 task</span></div>
+<div class="rule row"><div class="row-main"><span class="task-id">T-184</span><h3>Investigate coupon failure</h3><p class="small quiet">Maya requested · Sam narrowed to EU</p></div><span class="state">Review</span></div>
+<div class="approval">
+<h3>Create GitHub issue</h3>
+<div class="keyline"><span class="quiet">Repository</span><span class="mono">atlas/checkout</span></div>
+<div class="keyline"><span class="quiet">Visibility</span><span>Private engineering repository</span></div>
+<div class="keyline"><span class="quiet">Labels · Assignee</span><span>bug · Unassigned</span></div>
+<p class="preview-title">Two coupons fail on EU checkout</p>
+<div class="preview-content small"><p>Reproduction: add two eligible coupons, then submit checkout.</p><p>Expected: both discounts apply. Observed: checkout returns 422.</p><p>Evidence: chat report M-42, attached trace F-07, commit D-318.</p></div>
+<p class="notes">Revision 3 · Manager approval · Expires in 12 min<br>Creates one issue with the content shown above.</p>
+<div class="controls"><button class="action primary" type="button" disabled>Create issue</button><button class="action" type="button" disabled>Revise</button><button class="action text" type="button" disabled>Cancel</button></div>
+</div>
+</section>
+<section class="section"><div class="section-head"><h3>In progress</h3><span class="small quiet">2 tasks</span></div>
+<div class="rule row"><div class="row-main"><span class="task-id">T-185</span><h3>Compare release error rates</h3><p class="small quiet">Reading approved deploy report</p></div><span class="state">Running</span></div>
+<div class="rule row"><div class="row-main"><span class="task-id">T-186</span><h3>Summarize onboarding feedback</h3><p class="small quiet">Waiting for a task slot</p></div><span class="state">Queued</span></div>
+</section>
+<section class="section"><div class="section-head"><h3>Group controls</h3><span class="small quiet">Manager</span></div>
+<div class="keyline"><span>Release digest</span><span>Daily 09:00 · UTC</span></div>
+<div class="keyline"><span>Monthly allowance</span><span class="number">$12.40 / $50 · Demo</span></div>
+<div class="keyline"><span>Proactive replies</span><span>Off</span></div>
+</section>
+<footer class="bottom"><span>Context captured since Oct 1</span><span>Inspect memory</span></footer>
+</div>
+</section>
+<section class="variant" id="variant-b" aria-labelledby="heading-b">
+<div class="variant-title"><span class="letter">B</span><h2 id="heading-b">Investigation</h2></div>
+<p class="intent">A task opens as an evidence-led document. Best for reading, steering, and reviewing one piece of work.</p>
+<div class="screen b-screen">
+<header class="app-head"><span class="brand">asmo tag</span><span class="small quiet">All tasks</span></header>
+<div class="b-context">Atlas team / Engineering / <span class="mono">T-184</span></div>
+<h2 class="b-title">Coupon failure<br>on EU checkout</h2>
+<div class="b-status"><span>Waiting for manager approval</span><span class="quiet">4 min of work · Demo</span></div>
+<div class="controls"><button class="action" type="button" disabled>Pause task</button><button class="action text" type="button" disabled>Reply in Telegram</button></div>
+<section class="section"><div class="section-head"><h3>Findings</h3><span class="small quiet">3 sources</span></div>
+<div class="b-fact"><p>The failure begins when the second coupon is added. One-coupon checkout succeeds in the attached report.</p><div class="evidence"><span>M-42 · Team report</span><span>F-07 · Trace excerpt</span></div></div>
+<div class="b-fact"><p>The deploy changed coupon validation. The evidence supports investigating that change; it does not prove the root cause.</p><div class="evidence"><span>D-318 · Approved commit</span></div></div>
+</section>
+<section class="section"><div class="section-head"><h3>Work log</h3><span class="small quiet">Ordered events</span></div>
+<div class="event"><span class="event-time">10:02</span><div><h3>Maya started the task</h3><p class="small quiet">Investigate and draft an issue.</p></div></div>
+<div class="event"><span class="event-time">10:03</span><div><h3>Sam narrowed the scope</h3><p class="small quiet">Check only the EU deployment.</p></div></div>
+<div class="event"><span class="event-time">10:05</span><div><h3>Asmo drafted revision 3</h3><p class="small quiet">No external write has run.</p></div></div>
+</section>
+<section class="b-approval"><h3>One issue, ready to review</h3><p class="small mono">atlas/checkout · Private</p><p class="preview-title">Two coupons fail on EU checkout</p><div class="preview-content small"><p>Steps: add two coupons and submit checkout.</p><p>Expected discounts apply. Observed response is 422.</p><p>Sources: M-42, F-07, D-318. Label: bug. No assignee.</p></div><p class="notes">Revision 3 expires in 12 min. Approval creates this issue only.</p><div class="controls"><button class="action primary" type="button" disabled>Approve issue</button><button class="action" type="button" disabled>Request revision</button><button class="action text" type="button" disabled>Cancel</button></div></section>
+<div class="split-meta"><div><span>Allowed context</span>Engineering group + atlas/checkout</div><div><span>Task allowance</span>$0.18 / $2 · Simulated</div></div>
+<div class="split-meta"><div><span>Memory used</span>EU release procedure</div><div><span>Follow-up</span>Watch issue after creation</div></div>
+<footer class="bottom"><span>Older chat history unavailable</span><span>View policy and audit</span></footer>
+</div>
+</section>
+<section class="variant" id="variant-c" aria-labelledby="heading-c">
+<div class="variant-title"><span class="letter">C</span><h2 id="heading-c">Control room</h2></div>
+<p class="intent">A dense workspace view with permissions beside activity. Best for owners managing access, routines, and spend.</p>
+<div class="screen c-screen">
+<header class="app-head"><span class="brand">asmo tag</span><span class="mono quiet">WORKSPACE 01</span></header>
+<div class="c-workspace"><h2>Atlas team</h2><p class="quiet">Engineering · Manager view · Invented workspace</p></div>
+<div class="nav" aria-label="Proposed navigation"><span class="active">Overview</span><span>Access</span><span>Memory</span><span>Audit</span></div>
+<div class="c-grid"><div><b>02</b><span class="quiet">Active tasks</span></div><div><b>01</b><span class="quiet">Approval pending</span></div><div><b>$12.40</b><span class="quiet">Month spend · Demo</span></div><div><b>$50.00</b><span class="quiet">Month allowance · Demo</span></div></div>
+<section class="section"><div class="section-head"><h3>Task queue</h3><span class="count">03 RECORDS</span></div><table><caption class="tiny quiet" style="text-align:left;padding-bottom:6px">Select a task to inspect its exact action.</caption><thead><tr><th>ID</th><th>Work</th><th>State</th></tr></thead><tbody><tr><td class="mono">T-184</td><td>EU coupon failure</td><td>Approval</td></tr><tr><td class="mono">T-185</td><td>Release error rates</td><td>Running</td></tr><tr><td class="mono">T-186</td><td>Onboarding feedback</td><td>Queued</td></tr></tbody></table><div class="controls"><button class="action primary" type="button" disabled>Review T-184</button><button class="action" type="button" disabled>Stop T-185</button></div></section>
+<section class="section"><div class="section-head"><h3>Access contract</h3><span class="count">POLICY 04</span></div><div class="config-row"><span class="label">Source</span><span>Engineering group only</span></div><div class="config-row"><span class="label">GitHub</span><span class="mono">atlas/checkout</span></div><div class="config-row"><span class="label">Read</span><span>Issues, commits, approved files</span></div><div class="config-row"><span class="label">Write</span><span>Create issues after manager approval</span></div><div class="config-row"><span class="label">Code work</span><span>Unavailable in this build</span></div><div class="controls"><button class="action" type="button" disabled>Manage grants</button><button class="action text" type="button" disabled>Revoke GitHub</button></div></section>
+<section class="section"><div class="section-head"><h3>Standing work</h3><span class="count">01 ROUTINE</span></div><div class="row rule"><div><h3>Release digest</h3><p class="quiet small">Daily 09:00 UTC · Engineering group</p></div><span class="state">Active</span></div><div class="keyline"><span class="quiet">Next run</span><span>Oct 7, 09:00 UTC · Demo</span></div><div class="keyline"><span class="quiet">Run allowance</span><span>$0.50 · Simulated</span></div><div class="controls"><button class="action" type="button" disabled>Pause digest</button><button class="action text" type="button" disabled>Inspect sources</button></div></section>
+<section class="section"><div class="section-head"><h3>Stored knowledge</h3><span class="count">06 FACTS</span></div><div class="config-row"><span class="label">Collection</span><span>Since Oct 1 · 30-day retention</span></div><div class="config-row"><span class="label">DM content</span><span>Excluded from this group</span></div><div class="config-row"><span class="label">Memory</span><span>Pilot: explicit facts + reviewed candidates</span></div></section>
+<div class="denial"><h3>Proactive replies are off</h3><p>Task replies and the approved digest remain active. Unrequested ambient posts are disabled.</p></div>
+<footer class="bottom"><span>Export audit</span><span>Inspect deletion scope</span></footer>
+</div>
+</section>
+</main>
+<footer class="page-footer"><p>A favors a shared task inbox. B favors an evidence-led task document. C favors owner controls. Each uses true black, white text, dense rows, and plain status labels.</p><p class="quiet">Pick a structure before implementing real Mini App components. Exact authorization, revocation, action previews, and stop behavior are required in every version. Layout choice does not change product policy. Automatic memory, personal connectors, and member-managed routines remain part of the full target. Asmo Djinn is a naming option.</p></footer>
+</body>
+</html>
