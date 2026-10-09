@@ -23,6 +23,7 @@
     "build": "tsc -p tsconfig.build.json"
   },
   "dependencies": {
+    "@js-temporal/polyfill": "0.5.1",
     "abort-controller": "3.0.0",
     "grammy": "1.46.0",
     "openai": "7.28.0",
