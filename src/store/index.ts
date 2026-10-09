@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { connectDatabase, inDatabaseTransaction } from "./connection.js";
 import type { Db } from "./connection.js";
 import { z } from "zod";
-import { conversationAnswer } from "../conversation.js";
+import { conversationAnswer, greetingReply } from "../conversation.js";
 import {
   approvalSchema, commandSchema, effectSchema, eventSchema, grantSchema, memorySchema,
   routineSchema, scopeSchema, sourceSchema, taskSchema, taskViewSchema, transcriptSchema,
@@ -574,7 +574,10 @@ class SQLiteStore implements Store {
       const file: Source = { ...source, id: uuid(), text: update.file.text, kind: "text_file" };
       await db.query("INSERT INTO sources(workspace_id,scope_id,id,data) VALUES($1,$2,$3,$4)", [scope.workspaceId, scope.id, file.id, JSON.stringify(file)]);
     }
-    const linked = update.replyTo === null ? null : (await rows(db, "SELECT task_id FROM messages WHERE workspace_id=$workspace AND scope_id=$1 AND message_id=$2 AND task_id IS NOT NULL ORDER BY (chat_id=$3) DESC LIMIT 1", [scope.id, update.replyTo, update.chatId], z.object({ task_id: z.string() })))[0]?.task_id ?? null;
+    const reply = update.replyTo === null ? null : (await rows(db, "SELECT task_id,source_id FROM messages WHERE workspace_id=$workspace AND scope_id=$1 AND message_id=$2 ORDER BY (chat_id=$3) DESC LIMIT 1", [scope.id, update.replyTo, update.chatId], z.object({ task_id: z.string().nullable(), source_id: z.string().nullable() })))[0];
+    const linked = reply?.task_id ?? null;
+    const addressed = update.mentioned || scope.kind === "dm" || reply?.source_id === null;
+    const greeting = !linked && !update.file && addressed ? greetingReply(update.text) : null;
     const match = /^\/(\w+)(?:@\w+)?(?:\s+([\s\S]*))?$/.exec(update.text.trim());
     let receipt: Receipt = { kind: "ignored" };
     if (match) {
@@ -598,7 +601,11 @@ class SQLiteStore implements Store {
         receipt = { kind: "accepted" };
       } else if (name === "help" || name === "start") { await notice(db, scope, null, "Mention me with a question or task. Reply to one of my messages to keep working together. Use /settings for tools and access. Reply with /stop, /resume, or /status to control or inspect that work.", this.now()); receipt = { kind: "accepted" }; }
       else receipt = { kind: "denied", message: "Command unavailable or missing argument." };
-    } else if (linked || update.mentioned || scope.kind === "dm") {
+    } else if (greeting) {
+      const delivery: Delivery = { id: uuid(), scopeId: scope.id, taskId: null, chatId: scope.chatId, topicId: update.topicId, replyTo: update.messageId, text: greeting, buttons: [], messageId: null };
+      await queue(db, scope, null, "delivery", delivery.id, delivery, this.now());
+      receipt = { kind: "accepted" };
+    } else if (linked || addressed) {
       const command: Command = linked ? { kind: "steer", taskId: linked, text: update.text || "Use the attached text as task context." } : { kind: "start", instruction: update.text || "Inspect the attached text.", topicId: update.topicId };
       receipt = await this.commandIn(db, scope, { scopeId: scope.id, userId: update.userId, key: `telegram:${update.botId}:${update.updateId}`, command });
     }
