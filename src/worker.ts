@@ -1,4 +1,4 @@
-import type { IssueConnector, Messenger, ModelProvider, Store } from "./core.js";
+import type { IssueConnector, Job, Messenger, ModelProvider, Store } from "./core.js";
 
 export class Worker {
   private readonly active = new Map<string, AbortController>();
@@ -6,8 +6,8 @@ export class Worker {
 
   interrupt(taskId: string) { this.active.get(taskId)?.abort(); }
 
-  async step(workerId: string, signal: AbortSignal = new AbortController().signal): Promise<boolean> {
-    const job = await this.store.claim(workerId);
+  async step(workerId: string, signal: AbortSignal = new AbortController().signal, kind?: Job["kind"]): Promise<boolean> {
+    const job = await this.store.claim(workerId, kind);
     if (!job) return false;
     const deadline = AbortSignal.timeout(Math.max(1, job.lease.expiresAt - Date.now() - 100));
     const control = new AbortController();

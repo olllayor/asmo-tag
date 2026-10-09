@@ -3,24 +3,30 @@ import { z } from "zod";
 import { readModelConfig } from "./providers/provider-config.js";
 import { readIntegrationConfig } from "./integrations/config.js";
 
-const integer = (value: string | undefined, fallback: number) => z.coerce.number().int().positive().parse(value ?? fallback);
+const integer = (env: NodeJS.ProcessEnv, key: string, fallback: number) => {
+  const result = z.coerce.number().int().positive().safeParse(env[key] ?? fallback);
+  if (!result.success) throw new Error(`${key} must be a positive integer.`);
+  return result.data;
+};
 const required = (env: NodeJS.ProcessEnv, key: string) => {
   const value = env[key];
   if (!value) throw new Error(`Missing configuration: ${key}`);
   return value;
 };
 export function readConfig(env: NodeJS.ProcessEnv = process.env) {
-  const mode = z.enum(["fixture", "live"]).parse(env.ASMO_MODE);
+  const parsedMode = z.enum(["fixture", "live"]).safeParse(env.ASMO_MODE);
+  if (!parsedMode.success) throw new Error("ASMO_MODE must be fixture or live.");
+  const mode = parsedMode.data;
   if (!env.ASMO_DATABASE_PATH && (env.ASMO_DATABASE_URL || env.ASMO_MIGRATION_DATABASE_URL)) throw new Error("ASMO_DATABASE_URL is no longer supported. Set ASMO_DATABASE_PATH to a SQLite file.");
   if (env.ASMO_DATABASE_PATH !== undefined && (!env.ASMO_DATABASE_PATH.trim() || /^[a-z][a-z0-9+.-]*:\/\//i.test(env.ASMO_DATABASE_PATH))) throw new Error("ASMO_DATABASE_PATH must be a local SQLite file path");
   const common = {
     mode, databasePath: resolve(env.ASMO_DATABASE_PATH ?? (mode === "fixture" ? "work/asmo-fixture.sqlite" : "work/asmo-pilot.sqlite")),
-    port: integer(env.ASMO_PORT, 8787), host: env.ASMO_HOST ?? "127.0.0.1",
+    port: integer(env, "ASMO_PORT", 8787), host: env.ASMO_HOST ?? "127.0.0.1",
     fixtureDirectory: resolve(env.ASMO_FIXTURE_DIRECTORY ?? "work/fixtures"),
-    maxOutputTokens: integer(env.ASMO_MAX_OUTPUT_TOKENS, 2048),
-    maxTurns: integer(env.ASMO_MAX_TURNS, 12), leaseMs: integer(env.ASMO_LEASE_MS, 60000),
-    taskBudgetMicros: integer(env.ASMO_TASK_BUDGET_MICROS, 2000000),
-    modelReserveMicros: integer(env.ASMO_MODEL_RESERVE_MICROS, 100000),
+    maxOutputTokens: integer(env, "ASMO_MAX_OUTPUT_TOKENS", 2048),
+    maxTurns: integer(env, "ASMO_MAX_TURNS", 12), leaseMs: integer(env, "ASMO_LEASE_MS", 60000),
+    taskBudgetMicros: integer(env, "ASMO_TASK_BUDGET_MICROS", 2000000),
+    modelReserveMicros: integer(env, "ASMO_MODEL_RESERVE_MICROS", 100000),
     miniAppLink: env.ASMO_MINIAPP_LINK,
   };
   if (mode === "fixture") {

@@ -4,6 +4,8 @@ import { equalSecret, validateInitData } from "../src/telegram/auth.js";
 import { normalizeUpdate } from "../src/telegram/updates.js";
 import { attachTextFile, type TelegramFileGateway } from "../src/telegram/files.js";
 import { readConfig } from "../src/config.js";
+import { telegramReplyMarkup } from "../src/telegram/messenger.js";
+import type { Delivery } from "../src/core.js";
 
 const now = 1_790_000_000_000;
 const token = "123456:synthetic-token";
@@ -17,6 +19,20 @@ function signed(values: Record<string, string>) {
 const user = JSON.stringify({ id: 101, first_name: "Synthetic" });
 const bot = { id: "999", username: "AsmoTagBot" };
 const message = { message_id: 10, from: { id: 101 }, chat: { id: -100, type: "supergroup" }, text: "👋 @AsmoTagBot investigate", entities: [{ type: "mention", offset: 3, length: 11 }] };
+
+describe("Conversation controls", () => {
+  const delivery: Delivery = { id: "delivery", taskId: "task", scopeId: "group", chatId: "-100", topicId: null, text: "Hello!", buttons: [], messageId: null };
+  const link = "https://t.me/AsmoTagBot/app";
+  it("keeps ordinary replies plain and offers Configure only for settings", () => {
+    expect(telegramReplyMarkup(delivery, link).inline_keyboard).toEqual([]);
+    expect(telegramReplyMarkup({ ...delivery, purpose: "settings" }, link).inline_keyboard).toEqual([[{ text: "Configure", url: `${link}?startapp=c_task` }]]);
+  });
+  it("preserves exact action controls and makes truncated answers inspectable", () => {
+    const buttons = [{ text: "Approve", data: "approve:exact-action" }, { text: "Deny", data: "deny:exact-action" }];
+    expect(telegramReplyMarkup({ ...delivery, buttons }, link).inline_keyboard).toEqual(buttons.map(button => [{ text: button.text, callback_data: button.data }]));
+    expect(telegramReplyMarkup({ ...delivery, text: "a".repeat(4001) }, link).inline_keyboard).toEqual([[{ text: "Open full answer", url: `${link}?startapp=c_task` }]]);
+  });
+});
 
 describe("Telegram identity and intake boundaries", () => {
   it("verifies signed identity including the signature field and rejects tampering", () => {
@@ -70,6 +86,14 @@ describe("Bounded Telegram text attachments", () => {
 });
 
 describe("Explicit application configuration", () => {
+  it("names invalid startup settings without echoing their values", () => {
+    expect(() => readConfig({ ASMO_MODE: "secret-invalid-mode" })).toThrow("ASMO_MODE must be fixture or live.");
+    for (const key of ["ASMO_PORT", "ASMO_MAX_OUTPUT_TOKENS", "ASMO_MAX_TURNS", "ASMO_LEASE_MS", "ASMO_TASK_BUDGET_MICROS", "ASMO_MODEL_RESERVE_MICROS"]) {
+      for (const value of ["", "0", "-1", "1.5", "secret-invalid-value"]) {
+        expect(() => readConfig({ ASMO_MODE: "live", [key]: value })).toThrow(`${key} must be a positive integer.`);
+      }
+    }
+  });
   it("never switches missing live configuration into fixture mode", () => {
     expect(() => readConfig({ ASMO_DATABASE_PATH: "synthetic" })).toThrow();
     expect(() => readConfig({ ASMO_MODE: "live", ASMO_DATABASE_PATH: "synthetic" })).toThrow("Missing configuration: TELEGRAM_BOT_TOKEN");

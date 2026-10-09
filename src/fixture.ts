@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import type { Scope, Seed, Store } from "./core.js";
 
 export const fixtureBot = { id: "999", username: "asmo_fixture_bot" };
@@ -47,5 +46,3 @@ export async function enrichFixture(store: Store): Promise<void> {
   if (!current.memories.length) await store.command({ scopeId: fixtureScope, userId: "101", key: "fixture-memory-v1", command: { kind: "remember", content: "EU coupon investigations must distinguish observations from suspected causes.", evidenceIds: current.tasks[0]?.sources.slice(0, 1).map(source => source.id) ?? [], candidate: false } });
   if (!current.routines.length) await store.command({ scopeId: fixtureScope, userId: "102", key: "fixture-routine-v1", command: { kind: "create_routine", instruction: "Summarize captured release risks with source citations. Do not create an issue.", timezone: "UTC", nextAt: Date.now() + 86400000, intervalMs: 86400000, budgetMicros: 500000 } });
 }
-
-export const fixtureKey = () => randomUUID();

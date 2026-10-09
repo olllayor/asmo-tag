@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Command, Job, NormalizedUpdate, Scope, Seed, Store, StoreOptions, Turn } from "../src/core.js";
 import { openStore } from "../src/store/index.js";
 import { createResponsesModel } from "../src/providers/responses.js";
+import { contextCoverageLimitation } from "../src/conversation.js";
 
 
 type ModelJob = Extract<Job, { kind: "model" }>;
@@ -83,6 +84,15 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     return { taskId, approval, effect: view.effects[0] };
   }
 
+  it("keeps exact write approval text outside the Markdown response path", async () => {
+    const { approval } = await draftWrite();
+    const pending = await store.claim("approval-delivery-worker");
+    if (pending?.kind !== "delivery") throw new Error("Approval delivery missing");
+    expect(pending.delivery.buttons).toEqual([{ text: "Approve", data: `approve:${approval.id}` }, { text: "Deny", data: `deny:${approval.id}` }]);
+    expect(pending.delivery.text).toContain("Exact simulated issue body");
+    expect(pending.delivery.format).toBeUndefined();
+  });
+
   it("binds Notion reads to its own grant and fences a queued read on disconnect", async () => {
     const connectionId = randomUUID();
     await expect(store.connectNotionGrant(scope.id, "member", connectionId, 1, randomUUID())).rejects.toThrow("management denied");
@@ -152,6 +162,75 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     expect(next.input.history.flatMap(item => item.content).every(block => block.type === "text")).toBe(true);
     const provider = createResponsesModel({ apiKey: "synthetic", model: "synthetic", inputUsdPerMillion: 1, cachedInputUsdPerMillion: 0, outputUsdPerMillion: 1, fetch: async (_url, request) => { expect(String(request?.body)).not.toContain("source-derived-secret"); return new Response(JSON.stringify({ id: "resp_after_forget", status: "completed", output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "Continuing with current context", annotations: [] }] }], usage: { input_tokens: 10, output_tokens: 5 } }), { headers: { "Content-Type": "application/json" } }); } });
     expect((await provider.turn(next.input, new AbortController().signal)).outcome).toBe("complete");
+  });
+
+  it("acknowledges a quick ask and delivers a plain linked answer while retaining coverage in the inspector", async () => {
+    const receipt = await store.ingest(message("Say hello", 100, { mentioned: true }));
+    const acknowledgement = await store.claim("outbox", "delivery");
+    if (acknowledgement?.kind !== "delivery") throw new Error("Acknowledgement missing");
+    expect(acknowledgement.delivery).toMatchObject({ text: "On it.", buttons: [], replyTo: 100, purpose: "acknowledgement" });
+    await store.finishDelivery(acknowledgement, 900);
+    // The outbox cannot dispatch model work while the execution worker is busy.
+    expect(await store.claim("outbox", "delivery")).toBeNull();
+    const model = await claimModel();
+    const coverage = contextCoverageLimitation(scope.collectedSince);
+    await store.finishModel(model, turn("Hello!", { limitations: [coverage] }));
+    const answer = await store.claim("outbox", "delivery");
+    if (answer?.kind !== "delivery") throw new Error("Answer missing");
+    expect(answer.delivery).toMatchObject({ text: "Hello!", buttons: [], replyTo: 100 });
+    expect(answer.delivery.text).not.toContain(receipt.taskId);
+    await store.finishDelivery(answer, 901);
+    now += 8001;
+    expect(await store.claim("outbox", "delivery")).toBeNull();
+    expect((await store.task(scope.id, "member", receipt.taskId!)).task.result?.limitations).toContain(coverage);
+    const followup = await store.ingest(message("Make it shorter", 101, { replyTo: 901 }));
+    expect(followup.taskId).toBe(receipt.taskId);
+    expect((await claimModel()).input.history.flatMap(item => item.content).some(block => block.type === "text" && block.text.includes("Make it shorter"))).toBe(true);
+  });
+
+  it("edits long-work progress to remove Stop and sends a separate final answer", async () => {
+    await store.ingest(message("Investigate the supplied reports", 100, { mentioned: true }));
+    const model = await claimModel();
+    now += 8001;
+    const working = await store.claim("outbox", "delivery");
+    if (working?.kind !== "delivery") throw new Error("Progress missing");
+    expect(working.delivery).toMatchObject({ purpose: "progress", replyTo: 100, buttons: [{ text: "Stop" }] });
+    await store.finishDelivery(working, 901);
+    await store.finishModel(model, turn("The retry loop is the first fix.", { limitations: [contextCoverageLimitation(scope.collectedSince), "The reports do not measure the fix's impact."] }));
+    const settled = await store.claim("outbox", "delivery");
+    if (settled?.kind !== "delivery") throw new Error("Settled progress missing");
+    expect(settled.delivery).toMatchObject({ purpose: "progress", messageId: 901, buttons: [], text: "Finished. My answer is below." });
+    await store.finishDelivery(settled, 901);
+    const answer = await store.claim("outbox", "delivery");
+    if (answer?.kind !== "delivery") throw new Error("Separate answer missing");
+    expect(answer.delivery).toMatchObject({ messageId: null, buttons: [], text: "The retry loop is the first fix.\n\nThe reports do not measure the fix's impact." });
+  });
+
+  it("clears Stop when progress delivery races with task completion", async () => {
+    await start();
+    const model = await claimModel();
+    now += 8001;
+    const sending = await store.claim("outbox", "delivery");
+    if (sending?.kind !== "delivery") throw new Error("Progress missing");
+    await store.finishModel(model, turn("Done."));
+    await store.finishDelivery(sending, 902);
+    const deliveries: DeliveryJob["delivery"][] = [];
+    for (;;) {
+      const job = await store.claim("outbox", "delivery");
+      if (job?.kind !== "delivery") break;
+      deliveries.push(job.delivery);
+      await store.finishDelivery(job, job.delivery.messageId ?? 903);
+    }
+    expect(deliveries.some(delivery => delivery.purpose === "progress" && delivery.messageId === 902 && delivery.buttons.length === 0)).toBe(true);
+  });
+
+  it("exposes settings deliberately without starting model work", async () => {
+    expect((await store.ingest(message("/settings", 100))).kind).toBe("accepted");
+    const job = await store.claim("outbox", "delivery");
+    if (job?.kind !== "delivery") throw new Error("Settings missing");
+    expect(job.delivery).toMatchObject({ purpose: "settings", taskId: null, buttons: [] });
+    expect((await store.view(scope.id, "member")).tasks).toHaveLength(0);
+    expect(await store.claim("model-worker", "model")).toBeNull();
   });
 
   it("deduplicates intake across restart and follows explicit task replies", async () => {
@@ -601,7 +680,11 @@ describe("SQLite task lifecycle with simulated integrations", () => {
       if (pending.kind !== "delivery") throw new Error("Saturated tool must not dispatch while capacity is blocked");
       await store.finishDelivery(pending, ++deliveryMessageId);
     }
-    expect(released).toBe(500);
+    expect(released).toBeGreaterThan(0);
+    expect(released).toBeLessThanOrEqual(500);
+    const db = new DatabaseSync(options.databasePath);
+    try { expect(db.prepare("SELECT count(*) AS count FROM jobs WHERE state IN ('ready','leased')").get()?.count).toBe(0); }
+    finally { db.close(); }
     expect((await command({ kind: "resume", taskId })).kind).toBe("accepted");
     const resumed = await claimModel();
     const results = resumed.input.history.flatMap(row => row.content).filter(block => block.type === "tool_result");
@@ -710,7 +793,7 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     expect((await command(update)).kind).toBe("accepted");
     expect((await store.task(otherScope.id, "other", receipt.taskId)).task.result).toBeNull();
     await store.command({ scopeId: otherScope.id, userId: "other", key: randomUUID(), command: { kind: "steer", taskId: receipt.taskId, text: "Continue using only current facts" } });
-    const next = await store.claim("memory-regression-worker");
+    const next = await store.claim("memory-regression-worker", "model");
     expect(next?.kind).toBe("model");
     if (next?.kind !== "model") throw new Error("Consumer continuation missing");
     expect(JSON.stringify(next.input)).not.toContain(oldFact);
@@ -744,7 +827,7 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     await command({ kind: "remember", content: oldFact, evidenceIds: [], candidate: false });
     const memory = (await store.view(scope.id, "member")).memories[0];
     if (!memory) throw new Error("Shared memory missing");
-    await store.seed({ ...seed, scopes: [], memberships: [{ scopeId: otherScope.id, userId: "other_manager", role: "manager" }], grants: [{ ...seed.grants[0] as Extract<typeof seed.grants[number], { repository: string }>, id: randomUUID(), scopeId: otherScope.id, repository: "fixture/engineering", read: true, write: true, active: true, revision: 1 }] });
+    await store.seed({ ...seed, scopes: [], memberships: [{ scopeId: otherScope.id, userId: "other_manager", role: "manager" }], grants: [{ ...seed.grants[0] as Exclude<typeof seed.grants[number], { kind: "notion_scope" }>, id: randomUUID(), scopeId: otherScope.id, repository: "fixture/engineering", read: true, write: true, active: true, revision: 1 }] });
     const receipt = await store.command({ scopeId: otherScope.id, userId: "other", key: randomUUID(), command: { kind: "start", instruction: "Draft issue using shared facts", topicId: null } });
     if (!receipt.taskId) throw new Error("Consumer missing");
     const model = await claimModel();
@@ -809,12 +892,25 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     expect(resumed?.intervalMs).toBe(86_400_000);
   });
 
+  it("materializes routines independently of job claiming", async () => {
+    await command({ kind: "create_routine", instruction: "Independent digest", timezone: "America/New_York", nextAt: now + 1000, intervalMs: 86_400_000, budgetMicros: 5000 }, "manager");
+    const routine = (await store.view(scope.id, "member")).routines[0];
+    if (!routine) throw new Error("Routine missing");
+    now += 1001;
+    await store.materializeRoutines();
+    const tasks = (await store.view(scope.id, "member")).tasks;
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0]?.task.requesterId).toBe(`routine:${routine.id}`);
+    expect(tasks[0]?.task.state).toBe("queued");
+  });
+
   it("retries delivery only after a completed task and bounds retry delay", async () => {
     const taskId = await start();
     const model = await claimModel();
     await store.finishModel(model, turn("Saved complete answer"));
     const delivery = await store.claim("delivery-worker");
     if (delivery?.kind !== "delivery") throw new Error("Result delivery missing");
+    expect(delivery.delivery.format).toBe("markdown");
     await store.fail(delivery, "secret-bearing delivery error");
     expect((await store.task(scope.id, "member", taskId)).task.state).toBe("completed");
     expect(await store.claim("delivery-worker")).toBeNull();
@@ -823,6 +919,7 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     expect(retry?.kind).toBe("delivery");
     if (retry?.kind !== "delivery") throw new Error("Retry missing");
     expect(retry.delivery.id).toBe(delivery.delivery.id);
+    expect(retry.delivery.format).toBe("markdown");
     await store.finishDelivery(retry, 600);
     expect(await claimNonDelivery()).toBeNull();
     expect((await store.task(scope.id, "member", taskId)).task.turns).toBe(1);

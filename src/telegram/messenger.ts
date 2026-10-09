@@ -1,11 +1,49 @@
 import { mkdir, readFile, writeFile, rename } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { Api } from "grammy";
-import type { InlineKeyboardButton } from "grammy/types";
+import { Api, GrammyError } from "grammy";
+import type { InlineKeyboardButton, InputRichMessage } from "grammy/types";
 import { AbortController as TelegramAbortController } from "abort-controller";
 import { z } from "zod";
 import type { Delivery, Messenger, Scope, Store } from "../core.js";
+
+const richTextLimit = 32768;
+const truncationNotice = "\n\nFull saved result is available in the task inspector.";
+
+function plainRichMessage(text: string): InputRichMessage {
+  return { blocks: [{ type: "paragraph", text }], skip_entity_detection: true };
+}
+
+// Count Unicode characters for rich messages, and never split a UTF-16 surrogate pair.
+function deliveryContent(delivery: Delivery) {
+  if (delivery.format === "markdown") {
+    const characters = Array.from(delivery.text);
+    const truncated = characters.length > richTextLimit;
+    const text = truncated ? characters.slice(0, richTextLimit - truncationNotice.length).join("") + truncationNotice : delivery.text;
+    // Rich Markdown accepts HTML actions and media. Keep those model outputs literal.
+    const literal = text.includes("<") || text.includes("![");
+    return { text, truncated, rich: literal || truncated ? plainRichMessage(text) : { markdown: text } satisfies InputRichMessage };
+  }
+  const truncated = delivery.text.length > 4000;
+  let text = delivery.text;
+  if (truncated) {
+    const end = /[\uD800-\uDBFF]/u.test(text[3799] ?? "") ? 3799 : 3800;
+    text = text.slice(0, end) + truncationNotice;
+  }
+  return { text, truncated, rich: undefined };
+}
+
+function richFormattingRejected(error: unknown): boolean {
+  return error instanceof GrammyError && error.error_code === 400 && /(?:can't parse|cannot parse|failed to parse|invalid rich message|too many blocks|too many columns|nesting.*(?:limit|deep)|message is too long|message text is too long)/i.test(error.description);
+}
+
+export function telegramReplyMarkup(delivery: Delivery, miniAppLink?: string) {
+  const rows: InlineKeyboardButton[][] = delivery.buttons.map(button => [{ text: button.text, callback_data: button.data }]);
+  if (miniAppLink && (delivery.purpose === "settings" || deliveryContent(delivery).truncated)) {
+    rows.push([{ text: delivery.purpose === "settings" ? "Configure" : "Open full answer", url: `${miniAppLink}?startapp=${encodeURIComponent(`c_${delivery.taskId ?? delivery.scopeId}`)}` }]);
+  }
+  return { inline_keyboard: rows };
+}
 
 export function createTelegramMessenger(token: string, miniAppLink?: string): Messenger {
   const api = new Api(token, { timeoutSeconds: 30 });
@@ -16,22 +54,39 @@ export function createTelegramMessenger(token: string, miniAppLink?: string): Me
       const controller = new TelegramAbortController();
       const abort = () => controller.abort();
       signal.addEventListener("abort", abort, { once: true });
-      const rows: InlineKeyboardButton[][] = delivery.buttons.map(button => [{ text: button.text, callback_data: button.data }]);
-      if (miniAppLink) {
-        rows.push([{ text: "Configure", url: `${miniAppLink}?startapp=${encodeURIComponent(`c_${delivery.taskId ?? delivery.scopeId}`)}` }]);
-      }
-      const text = delivery.text.length > 4000 ? `${delivery.text.slice(0, 3800)}\n\nFull saved result is available in the task inspector.` : delivery.text;
-      const reply_markup = { inline_keyboard: rows };
+      const { text, rich } = deliveryContent(delivery);
+      const reply_markup = telegramReplyMarkup(delivery, miniAppLink);
       try {
-      if (delivery.messageId !== null) {
-        await api.editMessageText(delivery.chatId, delivery.messageId, text, { reply_markup }, controller.signal);
-        return { messageId: delivery.messageId };
-      }
-      const result = await api.sendMessage(delivery.chatId, text, {
-        reply_markup, ...(delivery.topicId !== null ? { message_thread_id: delivery.topicId } : {}),
-        ...(delivery.replyTo !== undefined ? { reply_parameters: { message_id: delivery.replyTo, allow_sending_without_reply: true } } : {}),
-      }, controller.signal);
-      return { messageId: result.message_id };
+        if (delivery.messageId !== null) {
+          try {
+            try { await api.editMessageText(delivery.chatId, delivery.messageId, rich ?? text, { reply_markup }, controller.signal); }
+            catch (error) {
+              if (!rich?.markdown || !richFormattingRejected(error)) throw error;
+              signal.throwIfAborted();
+              await api.editMessageText(delivery.chatId, delivery.messageId, plainRichMessage(text), { reply_markup }, controller.signal);
+            }
+          } catch (error) {
+            if (!(error instanceof GrammyError && error.error_code === 400 && error.description.includes("message is not modified"))) throw error;
+          }
+          return { messageId: delivery.messageId };
+        }
+        const options = {
+          reply_markup, ...(delivery.topicId !== null ? { message_thread_id: delivery.topicId } : {}),
+          ...(delivery.replyTo !== undefined ? { reply_parameters: { message_id: delivery.replyTo, allow_sending_without_reply: true } } : {}),
+        };
+        if (rich) {
+          try {
+            const result = await api.sendRichMessage(delivery.chatId, rich, options, controller.signal);
+            return { messageId: result.message_id };
+          } catch (error) {
+            if (!rich.markdown || !richFormattingRejected(error)) throw error;
+            signal.throwIfAborted();
+            const result = await api.sendRichMessage(delivery.chatId, plainRichMessage(text), options, controller.signal);
+            return { messageId: result.message_id };
+          }
+        }
+        const result = await api.sendMessage(delivery.chatId, text, options, controller.signal);
+        return { messageId: result.message_id };
       } finally {
         signal.removeEventListener("abort", abort);
       }

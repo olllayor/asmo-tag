@@ -83,20 +83,35 @@ async function main() {
   try {
     await new Promise<void>((accept, reject) => { server.once("error", reject); server.listen(config.port, config.host, accept); });
   } catch (error) { await app.close(); throw error; }
-  const loop = (async () => {
+  const runWorker = async (kind?: "delivery") => {
     while (!shutdown.signal.aborted) {
       try {
-        const worked = await app.worker.step(`server-${process.pid}`, shutdown.signal);
+        const workerId = `server-${process.pid}${kind ? "-delivery" : ""}`;
+        const worked = kind
+          ? await app.worker.step(workerId, shutdown.signal, kind)
+          : await app.worker.step(workerId, shutdown.signal, "effect") || await app.worker.step(workerId, shutdown.signal, "model");
         if (!worked) await setTimeout(500, undefined, { signal: shutdown.signal });
       } catch {
         if (!shutdown.signal.aborted) { console.error("Worker step failed. Inspect database health and task audit."); await setTimeout(1000); }
       }
     }
-  })();
+  };
+  const runScheduler = async () => {
+    while (!shutdown.signal.aborted) {
+      try {
+        await app.store.materializeRoutines();
+        await setTimeout(1000, undefined, { signal: shutdown.signal });
+      } catch {
+        if (!shutdown.signal.aborted) { console.error("Scheduler step failed. Inspect database health and routine audit."); await setTimeout(2000); }
+      }
+    }
+  };
+  // Keep the durable outbox and scheduled routines responsive while the model or a connector is awaiting HTTP.
+  const loops = [runWorker(), runWorker("delivery"), runScheduler()];
   console.log(`Asmo Tag listening at http://${config.host}:${config.port}/${config.mode === "fixture" ? "?fixture=1" : ""}`);
   const stop = () => { shutdown.abort(); server.close(); };
   process.once("SIGINT", stop); process.once("SIGTERM", stop);
-  await loop;
+  await Promise.all(loops);
   await app.close();
 }
 main().catch(error => {
