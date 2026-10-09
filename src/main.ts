@@ -86,7 +86,10 @@ async function main() {
   const runWorker = async (kind?: "delivery") => {
     while (!shutdown.signal.aborted) {
       try {
-        const worked = await app.worker.step(`server-${process.pid}${kind ? "-delivery" : ""}`, shutdown.signal, kind);
+        const workerId = `server-${process.pid}${kind ? "-delivery" : ""}`;
+        const worked = kind
+          ? await app.worker.step(workerId, shutdown.signal, kind)
+          : await app.worker.step(workerId, shutdown.signal, "effect") || await app.worker.step(workerId, shutdown.signal, "model");
         if (!worked) await setTimeout(500, undefined, { signal: shutdown.signal });
       } catch {
         if (!shutdown.signal.aborted) { console.error("Worker step failed. Inspect database health and task audit."); await setTimeout(1000); }
