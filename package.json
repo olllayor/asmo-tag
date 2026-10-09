@@ -23,7 +23,6 @@
     "build": "tsc -p tsconfig.build.json"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "0.131.0",
     "abort-controller": "3.0.0",
     "grammy": "1.46.0",
     "openai": "7.28.0",

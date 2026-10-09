@@ -2,7 +2,7 @@ import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createAnthropicModel, createFixtureModel } from "../src/providers/index.js";
+import { createFixtureModel } from "../src/providers/index.js";
 import { createFixtureConnector, createGitHubConnector } from "../src/connectors/index.js";
 import { correlationMarker } from "../src/connectors/boundary.js";
 import type { Effect, ModelInput, Transcript } from "../src/core.js";
@@ -21,107 +21,6 @@ function input(history: Transcript[] = []): ModelInput {
 function effect(): Effect {
   return { id: "effect-1", workspaceId: "workspace-1", taskId: "task-1", scopeId: "scope-1", call: { id: "tool-1", name: "github_create_issue", input: { repository: "acme/checkout", title: "Coupon fails", body: "EU coupon report [Source: source-1]", labels: ["bug"] } }, state: "dispatching", taskRevision: 1, policyRevision: 1, grantRevision: 1, hash: "exact-action-hash", result: null, providerId: null, url: null, reason: null };
 }
-
-function response(content: unknown, stopReason = "end_turn") {
-  return new Response(JSON.stringify({ id: "msg-test", type: "message", role: "assistant", model: "claude-test", content, stop_reason: stopReason, stop_sequence: null, usage: { input_tokens: 100, output_tokens: 20, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } }), { status: 200, headers: { "content-type": "application/json", "request-id": "request-test" } });
-}
-
-function model(fetcher: typeof fetch, maxRequestBytes = 100_000) {
-  return createAnthropicModel({ apiKey: "test-secret-never-live", model: "claude-test", inputUsdPerMillion: 3, outputUsdPerMillion: 15, maxRequestBytes, fetch: fetcher });
-}
-
-describe("Anthropic SDK boundary", () => {
-  it("serializes full assistant content and matching tool results through the real SDK", async () => {
-    let captured: unknown;
-    let capturedUrl = "";
-    let capturedHeaders: Headers | undefined;
-    const fetcher: typeof fetch = async (url, options) => {
-      capturedUrl = String(url);
-      capturedHeaders = new Headers(options?.headers);
-      captured = JSON.parse(String(options?.body));
-      return response([{ type: "text", text: "The report describes a coupon failure [Source: source-1].", citations: null }]);
-    };
-    const history: Transcript[] = [
-      { role: "user", content: [{ type: "text", text: input().task.instruction }] },
-      { role: "assistant", content: [{ type: "text", text: "Checking issues first." }, { type: "tool_use", id: "read-1", name: "github_read_issues", input: { repository: "acme/checkout" } }, { type: "text", text: "Keep the EU scope." }] },
-      { role: "user", content: [{ type: "tool_result", tool_use_id: "read-1", content: "No matching captured issues.", is_error: false }] },
-    ];
-    const turn = await model(fetcher).turn(input(history), signal());
-    expect(capturedUrl).toBe("https://api.anthropic.com/v1/messages");
-    expect(capturedHeaders?.get("x-api-key")).toBe("test-secret-never-live");
-    expect(captured).toMatchObject({ model: "claude-test", max_tokens: 4096, stream: false, tool_choice: { type: "auto", disable_parallel_tool_use: true }, messages: history });
-    expect(captured).not.toHaveProperty("thinking");
-    expect(captured).not.toHaveProperty("cache_control");
-    expect(JSON.stringify(captured)).toContain("untrusted evidence");
-    expect(JSON.stringify(captured)).toContain("bounded selection");
-    expect(JSON.stringify(captured)).toContain("Omitted sources do not prove that an event never occurred");
-    expect(JSON.stringify(captured)).toContain("Uncaptured history is unavailable");
-    expect(turn.sourceIds).toEqual(["source-1"]);
-    expect(turn.usage).toMatchObject({ inputTokens: 100, outputTokens: 20, costMicros: 600, simulated: false });
-  });
-
-  it("preserves text around a validated tool call", async () => {
-    const turn = await model(async () => response([{ type: "text", text: "Check evidence [Source: source-1]." }, { type: "tool_use", id: "read-1", name: "github_read_issues", input: { repository: "acme/checkout" } }, { type: "text", text: "Then draft." }], "tool_use")).turn(input(), signal());
-    expect(turn.outcome).toBe("tools");
-    expect(turn.message.content).toHaveLength(3);
-  });
-
-  it("preserves two historical tool calls and requires both immediate matching results", async () => {
-    const history: Transcript[] = [
-      { role: "user", content: [{ type: "text", text: "Read both repositories." }] },
-      { role: "assistant", content: [{ type: "text", text: "Checking both." }, { type: "tool_use", id: "read-1", name: "github_read_issues", input: { repository: "acme/checkout" } }, { type: "tool_use", id: "read-2", name: "github_read_issues", input: { repository: "acme/payments" } }] },
-      { role: "user", content: [{ type: "tool_result", tool_use_id: "read-1", content: "Checkout results", is_error: false }, { type: "tool_result", tool_use_id: "read-2", content: "Payments results", is_error: false }] },
-    ];
-    let captured: unknown;
-    let count = 0;
-    const fetcher: typeof fetch = async (_url, options) => { count++; captured = JSON.parse(String(options?.body)); return response([{ type: "text", text: "Both read results are available." }]); };
-    await model(fetcher).turn(input(history), signal());
-    expect(captured).toMatchObject({ messages: history });
-    const missing: Transcript[] = [...history.slice(0, 2), { role: "user", content: [{ type: "tool_result", tool_use_id: "read-1", content: "Only one result", is_error: false }] }];
-    await expect(model(fetcher).turn(input(missing), signal())).rejects.toThrow("immediate matching tool results");
-    expect(count).toBe(1);
-  });
-
-  it.each(["max_tokens", "refusal", "pause_turn", "model_context_window_exceeded"])("marks %s incomplete", async stop => {
-    const turn = await model(async () => response([{ type: "text", text: "Partial answer." }], stop)).turn(input(), signal());
-    expect(turn.outcome).toBe("incomplete");
-    expect(turn.limitations.join(" ")).toContain(stop);
-  });
-
-  it("keeps explicit missing-input answers waiting and rejects invented source citations", async () => {
-    const turn = await model(async () => response([{ type: "text", text: "Needs input: Which approved repository should receive the issue?" }])).turn(input(), signal());
-    expect(turn.outcome).toBe("needs_input");
-    expect(turn.limitations.join(" ")).toContain("1970-01-01T00:00:00.000Z");
-    expect(turn.limitations.join(" ")).toContain("bounded selection");
-    expect(turn.limitations.join(" ")).toContain("Omitted sources do not prove absence");
-    await expect(model(async () => response([{ type: "text", text: "Found a root cause [Source: nonexistent]." }])).turn(input(), signal())).rejects.toThrow("outside the authorized context");
-  });
-
-  it("rejects unknown blocks and parallel tools explicitly", async () => {
-    await expect(model(async () => response([{ type: "thinking", thinking: "unsupported", signature: "x" }])).turn(input(), signal())).rejects.toThrow("Unsupported provider content block");
-    await expect(model(async () => response([{ type: "tool_use", id: "read-1", name: "github_read_issues", input: { repository: "acme/checkout" } }, { type: "tool_use", id: "read-2", name: "github_read_issues", input: { repository: "acme/checkout" } }], "tool_use")).turn(input(), signal())).rejects.toThrow("parallel tool");
-  });
-
-  it("rejects forbidden tools, unmatched history, oversized requests, and output caps before dispatch", async () => {
-    let count = 0;
-    const fetcher: typeof fetch = async () => { count++; return response([{ type: "text", text: "Done" }]); };
-    await expect(model(fetcher).turn(input([{ role: "user", content: [{ type: "tool_result", tool_use_id: "missing", content: "x", is_error: false }] }]), signal())).rejects.toThrow("Unmatched");
-    await expect(model(fetcher, 1024).turn(input(), signal())).rejects.toThrow("byte limit");
-    await expect(model(fetcher).turn({ ...input(), maxOutputTokens: 4097 }, signal())).rejects.toThrow();
-    expect(count).toBe(0);
-    await expect(model(async () => response([{ type: "tool_use", id: "x", name: "github_create_issue", input: { repository: "acme/checkout", title: "x", body: "x", labels: [] } }], "tool_use")).turn({ ...input(), tools: ["github_read_issues"] }, signal())).rejects.toThrow("unavailable tool");
-  });
-
-  it("does not retry or leak provider error content", async () => {
-    let count = 0;
-    const fetcher: typeof fetch = async () => { count++; return new Response(JSON.stringify({ error: { type: "rate_limit_error", message: "secret test-secret-never-live" } }), { status: 429, headers: { "content-type": "application/json" } }); };
-    await expect(model(fetcher).turn(input(), signal())).rejects.toThrow(/^Anthropic request failed \(status 429\)$/);
-    expect(count).toBe(1);
-    const controller = new AbortController(); controller.abort();
-    await expect(model(fetcher).turn(input(), controller.signal)).rejects.toThrow();
-    expect(count).toBe(1);
-  });
-});
 
 describe("fixture model", () => {
   it("uses actual instruction, sources, and ordered steering through a complete issue loop", async () => {
