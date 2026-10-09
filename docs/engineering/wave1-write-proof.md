@@ -52,6 +52,6 @@ The unreachable Anthropic adapter, its dependency, its obsolete tests, and unuse
 | P03 real approved issue | Not run | Test destinations not selected |
 | P05 live revocation | Not run | Requires isolated connection and exact action |
 | Named-issue watch | Deferred | Requires P03/P05 evidence |
-| Wall-clock/DST scheduling | In design | Separate backend feature gate; legacy UTC schedules retain their meaning |
+| Wall-clock/DST scheduling | Verified locally | [Explicit local schedule contract](local-routine-schedules.md); legacy UTC and Mini App behavior remain fixed UTC |
 
 The local decision trail is `work/wave1/decisions.tsv`. Local process and transport proofs do not pass the live Telegram, model, and GitHub gates.
