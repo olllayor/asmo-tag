@@ -8,6 +8,10 @@ The baseline passed 147 tests across nine files, backend and web TypeScript chec
 
 Read-only review found a delivery-order race beyond the baseline suite. Both serve workers could claim delivery jobs. A slow progress send could arrive after the answer. The isolated reproduction is `work/wave1/baseline-delivery-race.repro.ts`, run with `vitest run --config work/wave1/repro.config.ts`. Its broad-worker case failed and its dedicated-execution case passed. The intentional failure is excluded from the default suite by its `.repro.ts` filename. This finding does not establish a GitHub write failure. Follow-up changes and write gate evidence are recorded in [the Wave 1 report](wave1-write-proof.md).
 
+The local-time routine unit at source commit `061184cf556b8bcc4816f1206c7bd9c6ebb66c74` passed 171 tests across 12 files, both TypeScript checks, and isolated backend/web builds. The [routine contract](local-routine-schedules.md) defines DST, backlog, and durable calendar-date rules. Live write, live scheduling, and named-issue watch gates remain unrun.
+
+The primary checkout's existing `dist` was not rebuilt. Read-only inspection found that its provider barrel still exports the removed Anthropic adapter. That cached artifact needs a fresh build before reuse after dependency cleanup. No existing service was restarted or deployed.
+
 ## Historical PostgreSQL milestone
 
 This report records the historical PostgreSQL milestone. On October 6, 2026, the user selected SQLite for the current build. See [the current architecture](architecture.md) and [the SQLite migration report](sqlite-migration-report.md) for its separate verification. The 73-test result below is the pre-migration baseline, not proof of SQLite behavior.

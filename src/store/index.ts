@@ -3,6 +3,7 @@ import { connectDatabase, inDatabaseTransaction } from "./connection.js";
 import type { Db } from "./connection.js";
 import { z } from "zod";
 import { conversationAnswer } from "../conversation.js";
+import { firstDailyLocalAfter, firstDailyLocalAtOrAfter, latestDailyLocalCursor } from "../routine-schedule.js";
 import {
   approvalSchema, commandSchema, effectSchema, eventSchema, grantSchema, memorySchema,
   routineSchema, scopeSchema, sourceSchema, taskSchema, taskViewSchema, transcriptSchema,
@@ -401,17 +402,47 @@ class SQLiteStore implements Store {
     }
     if (command.kind === "create_routine") {
       try { new Intl.DateTimeFormat("en", { timeZone: command.timezone }).format(); } catch { return denied("Invalid timezone."); }
-      if (command.intervalMs !== 86_400_000) return denied("The pilot supports daily fixed UTC routines.");
-      const routine: Routine = { id: uuid(), scopeId: scope.id, createdBy: userId, instruction: command.instruction, state: "active", timezone: command.timezone, nextAt: command.nextAt, intervalMs: command.intervalMs, budgetMicros: command.budgetMicros };
+      if (command.intervalMs !== 86_400_000) return denied(command.schedule ? "The pilot supports daily local routines only." : "The pilot supports daily fixed UTC routines.");
+      let nextAt = command.nextAt;
+      let schedule: Routine["schedule"];
+      if (command.schedule) {
+        try {
+          const first = firstDailyLocalAtOrAfter(command.nextAt, command.timezone, command.schedule.time);
+          nextAt = first.at;
+          schedule = { ...command.schedule, nextDate: first.date };
+        } catch {
+          return denied("Invalid local schedule or UTC anchor.");
+        }
+      }
+      const routine: Routine = { id: uuid(), scopeId: scope.id, createdBy: userId, instruction: command.instruction, state: "active", timezone: command.timezone, nextAt, intervalMs: command.intervalMs, ...(schedule ? { schedule } : {}), budgetMicros: command.budgetMicros };
       await db.query("INSERT INTO routines(workspace_id,scope_id,id,data) VALUES($1,$2,$3,$4)", [scope.workspaceId, scope.id, routine.id, JSON.stringify(routine)]);
+      if (routine.schedule) {
+        await event(db, scope, null, userId, "routine_created", { routineId: routine.id, timezone: routine.timezone, time: routine.schedule.time, utcAnchor: command.nextAt, utcOccurrence: routine.nextAt, basis: "daily_local" }, this.now());
+        return { kind: "accepted", message: "Daily local schedule saved." };
+      }
       await event(db, scope, null, userId, "routine_created", { routineId: routine.id, timezone: routine.timezone, utcOccurrence: routine.nextAt, basis: "fixed_utc" }, this.now());
       return { kind: "accepted", message: "Daily fixed UTC schedule saved. Daylight saving changes shift its local time." };
     }
     if (command.kind === "set_routine") {
       const routine = (await records(db, "routines", routineSchema, "scope_id=$1 AND id=$2", [scope.id, command.routineId]))[0];
       if (!routine || routine.state === "revoked") return denied();
-      const nextAt = command.state === "active" && routine.nextAt <= this.now() ? routine.nextAt + (Math.floor((this.now() - routine.nextAt) / routine.intervalMs) + 1) * routine.intervalMs : routine.nextAt;
-      await save(db, "routines", { ...routine, state: command.state, nextAt });
+      const now = this.now();
+      let nextAt = routine.nextAt;
+      let schedule = routine.schedule;
+      if (command.state === "active" && routine.nextAt <= now) {
+        try {
+          if (schedule) {
+            const next = firstDailyLocalAfter(now, routine.timezone, schedule.time, schedule.nextDate);
+            nextAt = next.at;
+            schedule = { ...schedule, nextDate: next.date };
+          } else {
+            nextAt = routine.nextAt + (Math.floor((now - routine.nextAt) / routine.intervalMs) + 1) * routine.intervalMs;
+          }
+        } catch {
+          return denied("Could not resolve the next routine occurrence.");
+        }
+      }
+      await save(db, "routines", { ...routine, state: command.state, nextAt, ...(schedule ? { schedule } : {}) });
       await event(db, scope, null, userId, "routine_changed", { routineId: routine.id, state: command.state }, this.now());
       return { kind: "accepted" };
     }
@@ -651,20 +682,23 @@ class SQLiteStore implements Store {
     for (const location of result) {
       await this.scopeTransaction(location.scope_id, async (db, scope) => {
         const routine = (await records(db, "routines", routineSchema, "id=$1", [location.id]))[0];
-        if (!routine || routine.state !== "active" || routine.nextAt > this.now()) return;
+        const now = this.now();
+        if (!routine || routine.state !== "active" || routine.nextAt > now) return;
         if (!scope.active) { await save(db, "routines", { ...routine, state: "paused" }); return; }
-        const occurrence = routine.nextAt + Math.floor((this.now() - routine.nextAt) / routine.intervalMs) * routine.intervalMs;
+        const localCursor = routine.schedule ? latestDailyLocalCursor({ at: routine.nextAt, date: routine.schedule.nextDate }, now, routine.timezone, routine.schedule.time) : null;
+        const occurrence = localCursor?.occurrence ?? routine.nextAt + Math.floor((now - routine.nextAt) / routine.intervalMs) * routine.intervalMs;
+        const nextAt = localCursor?.nextAt ?? occurrence + routine.intervalMs;
         const existing = await rows(db, "SELECT task_id FROM occurrences WHERE workspace_id=$workspace AND routine_id=$1 AND at=$2", [routine.id, occurrence], z.object({ task_id: z.string() }));
         if (!existing.length) {
           const admission = await this.admissionReason(db, scope, null, 2);
-          if (admission) await event(db, scope, null, null, "routine_capacity_skipped", { routineId: routine.id, occurrence, reason: admission }, this.now());
+          if (admission) await event(db, scope, null, null, "routine_capacity_skipped", routine.schedule && localCursor ? { routineId: routine.id, occurrence, occurrenceDate: localCursor.occurrenceDate, reason: admission, basis: "daily_local", timezone: routine.timezone, time: routine.schedule.time } : { routineId: routine.id, occurrence, reason: admission }, this.now());
           else {
             const task = await this.createTask(db, scope, `routine:${routine.id}`, routine.instruction, null, routine.budgetMicros);
             await db.query("INSERT INTO occurrences(workspace_id,scope_id,routine_id,at,task_id) VALUES($1,$2,$3,$4,$5)", [scope.workspaceId, scope.id, routine.id, occurrence, task.id]);
-            await event(db, scope, task.id, null, "routine_occurrence", { routineId: routine.id, occurrence, basis: "fixed_utc" }, this.now());
+            await event(db, scope, task.id, null, "routine_occurrence", routine.schedule && localCursor ? { routineId: routine.id, occurrence, occurrenceDate: localCursor.occurrenceDate, basis: "daily_local", timezone: routine.timezone, time: routine.schedule.time } : { routineId: routine.id, occurrence, basis: "fixed_utc" }, this.now());
           }
         }
-        await save(db, "routines", { ...routine, nextAt: occurrence + routine.intervalMs });
+        await save(db, "routines", { ...routine, nextAt, ...(routine.schedule && localCursor ? { schedule: { ...routine.schedule, nextDate: localCursor.nextDate } } : {}) });
       });
     }
   }

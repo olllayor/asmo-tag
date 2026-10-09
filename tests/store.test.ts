@@ -904,6 +904,188 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     expect(tasks[0]?.task.state).toBe("queued");
   });
 
+  it("stores a canonical local cursor and materializes one occurrence across restart", async () => {
+    now = Date.parse("2026-03-07T15:00:00.000Z");
+    const created = await command({ kind: "create_routine", instruction: "Local morning digest", timezone: "America/New_York", nextAt: now, intervalMs: 86_400_000, schedule: { kind: "daily_local", time: "09:00" }, budgetMicros: 5000 }, "manager");
+    expect(created.kind).toBe("accepted");
+    const routine = (await store.view(scope.id, "member")).routines[0];
+    expect(routine?.schedule).toEqual({ kind: "daily_local", time: "09:00", nextDate: "2026-03-08" });
+    expect(routine?.nextAt).toBe(Date.parse("2026-03-08T13:00:00.000Z"));
+    if (!routine) throw new Error("Routine missing");
+
+    now = routine.nextAt;
+    await store.materializeRoutines();
+    await store.materializeRoutines();
+    await store.close();
+    store = await openStore(options);
+    await store.materializeRoutines();
+
+    const view = await store.view(scope.id, "member");
+    const routineTasks = view.tasks.filter(item => item.task.requesterId === `routine:${routine.id}`);
+    expect(routineTasks).toHaveLength(1);
+    expect(view.routines[0]?.nextAt).toBe(Date.parse("2026-03-09T13:00:00.000Z"));
+    expect(view.routines[0]?.schedule?.nextDate).toBe("2026-03-09");
+    const occurrenceEvent = routineTasks[0]?.events.find(event => event.kind === "routine_occurrence");
+    expect(occurrenceEvent?.detail).toMatchObject({ basis: "daily_local", time: "09:00", timezone: "America/New_York", occurrenceDate: "2026-03-08" });
+  });
+
+  it.each([
+    ["spring", "2026-03-07T14:00:00Z", "2026-03-08T13:00:00Z"],
+    ["fall", "2026-10-31T13:00:00Z", "2026-11-01T14:00:00Z"],
+  ])("keeps 09:00 local time when materializing across the %s DST change", async (_season, first, next) => {
+    now = Date.parse(first);
+    expect((await command({ kind: "create_routine", instruction: "DST morning digest", timezone: "America/New_York", nextAt: now, intervalMs: 86_400_000, schedule: { kind: "daily_local", time: "09:00" }, budgetMicros: 5000 }, "manager")).kind).toBe("accepted");
+    const routine = (await store.view(scope.id, "member")).routines[0];
+    if (!routine) throw new Error("Routine missing");
+    expect(routine.nextAt).toBe(Date.parse(first));
+    await store.materializeRoutines();
+    expect((await store.view(scope.id, "member")).routines[0]?.nextAt).toBe(Date.parse(next));
+    now = Date.parse(next);
+    await store.materializeRoutines();
+    await store.materializeRoutines();
+    const tasks = (await store.view(scope.id, "member")).tasks.filter(item => item.task.requesterId === `routine:${routine.id}`);
+    expect(tasks).toHaveLength(2);
+    const occurrences = tasks.flatMap(item => item.events.filter(event => event.kind === "routine_occurrence")).sort((left, right) => left.at - right.at);
+    expect(occurrences.map(event => event.detail)).toMatchObject([{ occurrence: Date.parse(first) }, { occurrence: Date.parse(next) }]);
+  });
+
+  it("materializes only the latest local occurrence after distant active downtime", async () => {
+    now = Date.parse("2010-01-01T08:00:00Z");
+    await command({ kind: "create_routine", instruction: "Latest missed digest", timezone: "UTC", nextAt: now, intervalMs: 86_400_000, schedule: { kind: "daily_local", time: "09:00" }, budgetMicros: 5000 }, "manager");
+    const routine = (await store.view(scope.id, "member")).routines[0];
+    if (!routine) throw new Error("Routine missing");
+    now = Date.parse("2026-10-09T11:00:00Z");
+    await store.materializeRoutines();
+    await store.materializeRoutines();
+    const view = await store.view(scope.id, "member");
+    const tasks = view.tasks.filter(item => item.task.requesterId === `routine:${routine.id}`);
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0]?.events.find(event => event.kind === "routine_occurrence")?.detail).toMatchObject({ occurrence: Date.parse("2026-10-09T09:00:00Z") });
+    expect(view.routines[0]?.nextAt).toBe(Date.parse("2026-10-10T09:00:00Z"));
+    expect(view.routines[0]?.schedule?.nextDate).toBe("2026-10-10");
+  });
+
+  it("skips overdue local routine backlog when resumed", async () => {
+    now = Date.parse("2026-06-01T08:00:00.000Z");
+    await command({ kind: "create_routine", instruction: "Resume local digest", timezone: "UTC", nextAt: now, intervalMs: 86_400_000, schedule: { kind: "daily_local", time: "09:00" }, budgetMicros: 5000 }, "manager");
+    const routine = (await store.view(scope.id, "member")).routines[0];
+    if (!routine) throw new Error("Routine missing");
+    expect((await command({ kind: "set_routine", routineId: routine.id, state: "paused" }, "manager")).kind).toBe("accepted");
+    now = Date.parse("2026-06-04T12:00:00.000Z");
+    expect((await command({ kind: "set_routine", routineId: routine.id, state: "active" }, "manager")).kind).toBe("accepted");
+    await store.materializeRoutines();
+    const resumed = (await store.view(scope.id, "member")).routines[0];
+    expect(resumed?.nextAt).toBe(Date.parse("2026-06-05T09:00:00.000Z"));
+    expect(resumed?.schedule?.nextDate).toBe("2026-06-05");
+    expect((await store.view(scope.id, "member")).tasks.filter(item => item.task.requesterId === `routine:${routine.id}`)).toHaveLength(0);
+  });
+
+  it("skips a folded local occurrence when resumed between its two UTC instants", async () => {
+    now = Date.parse("2026-10-31T16:00:00.000Z");
+    await command({ kind: "create_routine", instruction: "Fold resume digest", timezone: "America/New_York", nextAt: now, intervalMs: 86_400_000, schedule: { kind: "daily_local", time: "01:30" }, budgetMicros: 5000 }, "manager");
+    const routine = (await store.view(scope.id, "member")).routines[0];
+    if (!routine) throw new Error("Routine missing");
+    expect(routine.nextAt).toBe(Date.parse("2026-11-01T05:30:00.000Z"));
+    await command({ kind: "set_routine", routineId: routine.id, state: "paused" }, "manager");
+    now = Date.parse("2026-11-01T06:00:00.000Z");
+    expect((await command({ kind: "set_routine", routineId: routine.id, state: "active" }, "manager")).kind).toBe("accepted");
+    await store.materializeRoutines();
+    expect((await store.view(scope.id, "member")).routines[0]?.nextAt).toBe(Date.parse("2026-11-02T06:30:00.000Z"));
+    expect((await store.view(scope.id, "member")).tasks.filter(item => item.task.requesterId === `routine:${routine.id}`)).toHaveLength(0);
+  });
+
+  it("materializes one Apia occurrence when adjacent local dates resolve to the same instant", async () => {
+    now = Date.parse("2011-12-30T00:00:00.000Z");
+    await command({ kind: "create_routine", instruction: "Apia skipped-date digest", timezone: "Pacific/Apia", nextAt: now, intervalMs: 86_400_000, schedule: { kind: "daily_local", time: "09:00" }, budgetMicros: 5000 }, "manager");
+    const routine = (await store.view(scope.id, "member")).routines[0];
+    if (!routine) throw new Error("Routine missing");
+    expect(routine.nextAt).toBe(Date.parse("2011-12-30T19:00:00.000Z"));
+    now = routine.nextAt;
+    await store.materializeRoutines();
+    await store.materializeRoutines();
+    const view = await store.view(scope.id, "member");
+    expect(view.tasks.filter(item => item.task.requesterId === `routine:${routine.id}`)).toHaveLength(1);
+    expect(view.routines[0]?.nextAt).toBe(Date.parse("2011-12-31T19:00:00.000Z"));
+    expect(view.routines[0]?.schedule?.nextDate).toBe("2012-01-01");
+  });
+
+  it("advances a local routine cursor when capacity skips the occurrence", async () => {
+    now = Date.parse("2026-06-01T08:00:00.000Z");
+    await command({ kind: "create_routine", instruction: "Capacity local digest", timezone: "UTC", nextAt: now, intervalMs: 86_400_000, schedule: { kind: "daily_local", time: "09:00" }, budgetMicros: 5000 }, "manager");
+    const routine = (await store.view(scope.id, "member")).routines[0];
+    if (!routine) throw new Error("Routine missing");
+    for (let index = 0; index < 20; index += 1) {
+      expect((await command({ kind: "start", instruction: `Capacity fixture ${index}`, topicId: null })).kind).toBe("accepted");
+    }
+    now = routine.nextAt;
+    await store.materializeRoutines();
+    expect((await store.view(scope.id, "member")).routines[0]?.nextAt).toBe(Date.parse("2026-06-02T09:00:00.000Z"));
+    const db = new DatabaseSync(options.databasePath);
+    try {
+      const event = db.prepare("SELECT data FROM events WHERE workspace_id=? AND scope_id=? AND json_extract(data,'$.kind')='routine_capacity_skipped'").get(seed.workspaceId, scope.id) as { data: string } | undefined;
+      const occurrence = db.prepare("SELECT count(*) AS count FROM occurrences WHERE workspace_id=? AND routine_id=?").get(seed.workspaceId, routine.id) as { count: number } | undefined;
+      expect(event && JSON.parse(event.data)).toMatchObject({ detail: { basis: "daily_local", timezone: "UTC", time: "09:00", occurrenceDate: "2026-06-01" } });
+      expect(occurrence?.count).toBe(0);
+    } finally { db.close(); }
+  });
+
+  it("rejects invalid local schedule input without inserting a routine", async () => {
+    const invalid = await command({ kind: "create_routine", instruction: "Invalid local schedule", timezone: "UTC", nextAt: now + 0.5, intervalMs: 86_400_000, schedule: { kind: "daily_local", time: "09:00" }, budgetMicros: 5000 }, "manager");
+    expect(invalid.kind).toBe("denied");
+    for (const nextAt of [Number.MAX_SAFE_INTEGER, Date.parse("+010000-01-01T00:00:00Z"), Date.parse("9999-12-31T00:00:00Z"), Date.parse("0000-01-01T00:00:00Z")]) {
+      expect((await command({ kind: "create_routine", instruction: "Out-of-range local schedule", timezone: "UTC", nextAt, intervalMs: 86_400_000, schedule: { kind: "daily_local", time: "09:00" }, budgetMicros: 5000 }, "manager")).kind).toBe("denied");
+    }
+    await expect(command({ kind: "create_routine", instruction: "Invalid local time", timezone: "UTC", nextAt: now, intervalMs: 86_400_000, schedule: { kind: "daily_local", time: "24:00" }, budgetMicros: 5000 }, "manager")).rejects.toThrow();
+    expect((await store.view(scope.id, "member")).routines).toHaveLength(0);
+  });
+
+  it.each([
+    ["later", "2026-10-09T08:00:00Z", "2026-10-09T08:30:00Z"],
+    ["earlier", "2026-10-09T10:00:00Z", "2026-10-09T10:30:00Z"],
+    ["across midnight", "2026-10-08T23:00:00Z", "2026-10-09T09:30:00Z"],
+  ])("consumes the saved intended date once when current timezone resolution moves %s", async (_direction, saved, current) => {
+    now = Date.parse("2026-10-09T00:00:00Z");
+    await command({ kind: "create_routine", instruction: "Changed timezone rules digest", timezone: "UTC", nextAt: now, intervalMs: 86_400_000, schedule: { kind: "daily_local", time: "09:00" }, budgetMicros: 5000 }, "manager");
+    const routine = (await store.view(scope.id, "member")).routines[0];
+    if (!routine) throw new Error("Routine missing");
+    // A saved instant from older timezone rules differs from today's UTC resolution.
+    const db = new DatabaseSync(options.databasePath);
+    try { db.prepare("UPDATE routines SET data=json_set(data,'$.nextAt',?) WHERE workspace_id=? AND id=?").run(Date.parse(saved), seed.workspaceId, routine.id); }
+    finally { db.close(); }
+
+    now = Date.parse(current);
+    await store.materializeRoutines();
+    now = Date.parse("2026-10-09T12:00:00Z");
+    await store.materializeRoutines();
+    const view = await store.view(scope.id, "member");
+    const tasks = view.tasks.filter(item => item.task.requesterId === `routine:${routine.id}`);
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0]?.events.find(event => event.kind === "routine_occurrence")?.detail).toMatchObject({ occurrence: Date.parse(saved), occurrenceDate: "2026-10-09" });
+    expect(view.routines[0]?.nextAt).toBe(Date.parse("2026-10-10T09:00:00Z"));
+    expect(view.routines[0]?.schedule?.nextDate).toBe("2026-10-10");
+  });
+
+  it.each([
+    ["overdue", "2026-10-09T08:00:00Z", "2026-10-09T08:30:00Z", "2026-10-10T09:00:00Z", "2026-10-10"],
+    ["future", "2026-10-09T10:00:00Z", "2026-10-09T09:30:00Z", "2026-10-09T10:00:00Z", "2026-10-09"],
+  ])("resumes an %s saved cursor using its intended date after timezone rules change", async (_state, saved, current, nextAt, nextDate) => {
+    now = Date.parse("2026-10-09T00:00:00Z");
+    await command({ kind: "create_routine", instruction: "Changed timezone resume digest", timezone: "UTC", nextAt: now, intervalMs: 86_400_000, schedule: { kind: "daily_local", time: "09:00" }, budgetMicros: 5000 }, "manager");
+    const routine = (await store.view(scope.id, "member")).routines[0];
+    if (!routine) throw new Error("Routine missing");
+    const db = new DatabaseSync(options.databasePath);
+    try { db.prepare("UPDATE routines SET data=json_set(data,'$.nextAt',?) WHERE workspace_id=? AND id=?").run(Date.parse(saved), seed.workspaceId, routine.id); }
+    finally { db.close(); }
+    await command({ kind: "set_routine", routineId: routine.id, state: "paused" }, "manager");
+    now = Date.parse(current);
+    expect((await command({ kind: "set_routine", routineId: routine.id, state: "active" }, "manager")).kind).toBe("accepted");
+    await store.materializeRoutines();
+    const view = await store.view(scope.id, "member");
+    expect(view.routines[0]?.nextAt).toBe(Date.parse(nextAt));
+    expect(view.routines[0]?.schedule?.nextDate).toBe(nextDate);
+    expect(view.tasks.filter(item => item.task.requesterId === `routine:${routine.id}`)).toHaveLength(0);
+  });
+
   it("retries delivery only after a completed task and bounds retry delay", async () => {
     const taskId = await start();
     const model = await claimModel();

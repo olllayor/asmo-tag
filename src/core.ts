@@ -184,6 +184,11 @@ export const grantSchema = z.object({
   connectionId: id, connectionVersion: z.number().int().positive(), notionWorkspaceId: id,
 }));
 export type Grant = z.infer<typeof grantSchema>;
+export const routineScheduleSchema = z.object({
+  kind: z.literal('daily_local'),
+  time: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/),
+}).strict();
+const storedRoutineScheduleSchema = routineScheduleSchema.extend({ nextDate: z.iso.date() });
 export const routineSchema = z.object({
   id,
   scopeId: id,
@@ -193,6 +198,7 @@ export const routineSchema = z.object({
   timezone: z.string(),
   nextAt: z.number(),
   intervalMs: z.number().int().positive(),
+  schedule: storedRoutineScheduleSchema.optional(),
   budgetMicros: micros,
 });
 export type Routine = z.infer<typeof routineSchema>;
@@ -254,6 +260,7 @@ export const commandSchema = z.discriminatedUnion('kind', [
     timezone: z.string(),
     nextAt: z.number(),
     intervalMs: z.number().int().min(60000),
+    schedule: routineScheduleSchema.optional(),
     budgetMicros: micros,
   }),
   z.object({ kind: z.literal('set_routine'), routineId: id, state: z.enum(['active', 'paused', 'revoked']) }),
