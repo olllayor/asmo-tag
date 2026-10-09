@@ -1,5 +1,15 @@
 # Asmo Tag local build report
 
+## Wave 1 source baseline, October 9, 2026
+
+The current pilot source baseline is commit `efee1e1dbd10e47dc5c47ac54668a690d884459d`. It includes the existing SQLite, connector, conversation, scheduler, and outgoing Telegram Rich Message work. Documentation and local survey artifacts outside that source commit are not runtime evidence.
+
+The baseline passed 147 tests across nine files, backend and web TypeScript checks, and isolated backend and web builds. Commands used `npm exec --yes --package=pnpm@12.9.1 -- pnpm` because the global launcher is broken. Build outputs went to `work/wave1/backend-build` and `work/wave1/web-build`, preserving the existing live `dist` and web preview outputs.
+
+Read-only review found a delivery-order race beyond the baseline suite. Both serve workers could claim delivery jobs. A slow progress send could arrive after the answer. The isolated reproduction is `work/wave1/baseline-delivery-race.repro.ts`, run with `vitest run --config work/wave1/repro.config.ts`. Its broad-worker case failed and its dedicated-execution case passed. The intentional failure is excluded from the default suite by its `.repro.ts` filename. This finding does not establish a GitHub write failure. Follow-up changes and write gate evidence are recorded in [the Wave 1 report](wave1-write-proof.md).
+
+## Historical PostgreSQL milestone
+
 This report records the historical PostgreSQL milestone. On October 6, 2026, the user selected SQLite for the current build. See [the current architecture](architecture.md) and [the SQLite migration report](sqlite-migration-report.md) for its separate verification. The 73-test result below is the pre-migration baseline, not proof of SQLite behavior.
 
 Asmo Tag now runs a shared discussion-to-issue workflow through a real PostgreSQL database and a working React Mini App. A member starts scoped work, teammates steer it, and a manager approves the saved exact issue before creation. The local model and issue provider are explicitly simulated. Real Telegram, Anthropic Messages, and GitHub adapters exist, but their connected acceptance gates remain unrun.
