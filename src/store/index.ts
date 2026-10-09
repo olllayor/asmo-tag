@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { connectDatabase, inDatabaseTransaction } from "./connection.js";
 import type { Db } from "./connection.js";
 import { z } from "zod";
+import { conversationAnswer } from "../conversation.js";
 import {
   approvalSchema, commandSchema, effectSchema, eventSchema, grantSchema, memorySchema,
   routineSchema, scopeSchema, sourceSchema, taskSchema, taskViewSchema, transcriptSchema,
@@ -22,7 +23,7 @@ function grantForCall(grants: Grant[], call: ToolCall): Grant | undefined {
 type Location = z.infer<typeof locationSchema>;
 const locationSchema = z.object({ workspace_id: z.string(), scope_id: z.string() });
 const receiptSchema = z.object({ kind: z.enum(["accepted", "duplicate", "ignored", "denied"]), taskId: z.string().optional(), message: z.string().optional() });
-const deliverySchema = z.object({ id: z.string(), taskId: z.string().nullable(), scopeId: z.string(), chatId: z.string(), topicId: z.number().int().nullable(), text: z.string(), buttons: z.array(z.object({ text: z.string(), data: z.string() })), messageId: z.number().int().nullable(), replyTo: z.number().int().optional() });
+const deliverySchema = z.object({ id: z.string(), taskId: z.string().nullable(), scopeId: z.string(), chatId: z.string(), topicId: z.number().int().nullable(), text: z.string(), buttons: z.array(z.object({ text: z.string(), data: z.string() })), messageId: z.number().int().nullable(), replyTo: z.number().int().optional(), format: z.literal("markdown").optional(), purpose: z.enum(["acknowledgement", "progress", "settings"]).optional() });
 const jobRowSchema = z.object({ workspace_id: z.string(), scope_id: z.string(), task_id: z.string().nullable(), id: z.string(), entity_id: z.string(), kind: z.enum(["model", "effect", "delivery"]), data: z.unknown(), state: z.enum(["ready", "leased", "done", "held"]), token: z.string().nullable(), worker_id: z.string().nullable(), expires_at: z.coerce.number().nullable(), attempts: z.number() });
 const workspaceRowSchema = z.object({ budget: z.coerce.number(), held: z.coerce.number(), spent: z.coerce.number(), authority_revision: z.number() });
 const totalsSchema = z.object({ held: z.coerce.number(), spent: z.coerce.number() });
@@ -90,9 +91,35 @@ async function queue(db: Db, scope: Scope, taskId: string | null, kind: Job["kin
     await event(db, scope, taskId, null, "queue_capacity_held", { kind, limit: pendingJobLimitPerWorkspace }, now);
   }
 }
-async function notice(db: Db, scope: Scope, task: Task | null, text: string, now: number, buttons: Delivery["buttons"] = []): Promise<void> {
-  const delivery: Delivery = { id: uuid(), scopeId: scope.id, taskId: task?.id ?? null, chatId: scope.chatId, topicId: task?.topicId ?? null, text, buttons, messageId: null };
+async function notice(db: Db, scope: Scope, task: Task | null, text: string, now: number, buttons: Delivery["buttons"] = [], purpose?: Delivery["purpose"], format?: Delivery["format"]): Promise<void> {
+  const delivery: Delivery = { id: uuid(), scopeId: scope.id, taskId: task?.id ?? null, chatId: scope.chatId, topicId: task?.topicId ?? null, text, buttons, messageId: null, ...(purpose ? { purpose } : {}), ...(format ? { format } : {}) };
   await queue(db, scope, task?.id ?? null, "delivery", delivery.id, delivery, now);
+}
+
+// One durable progress message per task. Never post a late working notice after the answer.
+async function progress(db: Db, scope: Scope, task: Task, text: string, now: number, delayMs = 0): Promise<void> {
+  const id = `progress:${task.id}`;
+  const existing = (await rows(db, "SELECT * FROM jobs WHERE workspace_id=$workspace AND kind='delivery' AND entity_id=$1", [id], jobRowSchema))[0];
+  if (existing?.state === "leased") return;
+  const previous = existing ? deliverySchema.parse(existing.data) : undefined;
+  const active = task.state === "queued" || task.state === "running";
+  const delivery: Delivery = { id, scopeId: scope.id, taskId: task.id, chatId: scope.chatId, topicId: task.topicId, text, buttons: active ? [{ text: "Stop", data: `stop:${task.id}` }] : [], messageId: previous?.messageId ?? null, purpose: "progress" };
+  if (existing?.state === "done" && previous?.text === delivery.text && JSON.stringify(previous.buttons) === JSON.stringify(delivery.buttons)) return;
+  if (!active && delivery.messageId === null) {
+    if (existing) await db.query("UPDATE jobs SET state='done',data=$2 WHERE workspace_id=$workspace AND id=$1", [existing.id, JSON.stringify(delivery)]);
+    return;
+  }
+  if (existing?.state === "ready") await db.query("UPDATE jobs SET data=$2 WHERE workspace_id=$workspace AND id=$1", [existing.id, JSON.stringify(delivery)]);
+  await queue(db, scope, task.id, "delivery", id, delivery, now);
+  if (delayMs) await db.query("UPDATE jobs SET ready_at=$2 WHERE workspace_id=$workspace AND kind='delivery' AND entity_id=$1 AND state='ready'", [id, now + delayMs]);
+}
+
+function settledProgress(task: Task): string {
+  if (task.state === "completed") return "Finished. My answer is below.";
+  if (task.state === "waiting_for_approval") return "Waiting for a manager to review the proposed action.";
+  if (task.state === "waiting_for_input") return "Waiting for your reply.";
+  if (task.state === "stopping") return "Stopping. An operation may still be in flight.";
+  return "I'm not working on this right now.";
 }
 
 export async function migrateDatabase(databasePath: string): Promise<void> {
@@ -221,7 +248,8 @@ class SQLiteStore implements Store {
     await append(db, task, { role: "user", content: [{ type: "text", text: instruction }] });
     await event(db, scope, task.id, userId, "task_started", { revision: task.revision }, this.now());
     await queue(db, scope, task.id, "model", task.id, {}, this.now());
-    await notice(db, scope, task, `Task ${task.id} accepted.`, this.now(), [{ text: "Stop", data: `stop:${task.id}` }]);
+    await notice(db, scope, task, "On it.", this.now(), [], "acknowledgement");
+    await progress(db, scope, task, "I'm still working on this.", this.now(), 8000);
     return task;
   }
   async admissionReason(db: Db, scope: Scope, excludedTaskId: string | null, requiredJobs: number): Promise<string | null> {
@@ -285,7 +313,7 @@ class SQLiteStore implements Store {
   async applyCommand(db: Db, scope: Scope, userId: string, role: string, command: Command): Promise<Receipt> {
     const denied = (message = "Action denied."): Receipt => ({ kind: "denied", message });
     if (!scope.active && !["set_scope", "stop", "cancel", "forget_sources", "correct_memory", "set_memory"].includes(command.kind)) return denied("Scope inactive.");
-    if (command.kind === "start") { const reason = await this.admissionReason(db, scope, null, 2); if (reason) return denied(reason); const task = await this.createTask(db, scope, userId, command.instruction, command.topicId); return { kind: "accepted", taskId: task.id }; }
+    if (command.kind === "start") { const reason = await this.admissionReason(db, scope, null, 3); if (reason) return denied(reason); const task = await this.createTask(db, scope, userId, command.instruction, command.topicId); return { kind: "accepted", taskId: task.id }; }
     if (["steer", "stop", "resume", "cancel"].includes(command.kind) && "taskId" in command) {
       const task = (await records(db, "tasks", taskSchema, "scope_id=$1 AND id=$2", [scope.id, command.taskId]))[0];
       if (!task) return denied();
@@ -299,6 +327,8 @@ class SQLiteStore implements Store {
         await db.query("UPDATE jobs SET state='held' WHERE workspace_id=$workspace AND kind='model' AND entity_id=$1", [task.id]);
         await queue(db, scope, task.id, "model", task.id, {}, this.now());
         await event(db, scope, task.id, userId, "steering_recorded", { text: command.text, revision: updated.revision }, this.now());
+        await notice(db, scope, updated, "Got it.", this.now(), [], "acknowledgement");
+        await progress(db, scope, updated, "I'm working through your update.", this.now(), 8000);
       } else if (command.kind === "stop" || command.kind === "cancel") {
         const inflight = (await records(db, "effects", effectSchema, "task_id=$1 AND data->>'state' IN ('dispatching','unknown')", [task.id])).length;
         const running = await rows(db, "SELECT id FROM jobs WHERE workspace_id=$workspace AND task_id=$1 AND kind='model' AND state='leased' AND expires_at>$2", [task.id, this.now()], z.object({ id: z.string() }));
@@ -307,7 +337,8 @@ class SQLiteStore implements Store {
         await this.invalidateEffects(db, scope, updated, "Dispatch stopped.");
         await db.query("UPDATE jobs SET state='held' WHERE workspace_id=$workspace AND task_id=$1 AND kind='model' AND state='ready'", [task.id]);
         await event(db, scope, task.id, userId, command.kind === "stop" ? "stop_requested" : "task_canceled", { inFlightEffects: inflight }, this.now());
-        await notice(db, scope, updated, `Task ${task.id}: ${updated.state}.${inflight ? " External outcome remains pending." : ""}`, this.now());
+        await notice(db, scope, updated, `${updated.state === "stopping" ? "I’m stopping." : updated.state === "canceled" ? "I’ve canceled this work." : "I’ve stopped."}${inflight ? " An external action is still pending. I’ll confirm its outcome before any retry." : " Completed actions are retained."}`, this.now());
+        await progress(db, scope, updated, settledProgress(updated), this.now());
       } else {
         if (!["paused", "stopping", "blocked", "failed", "waiting_for_input"].includes(task.state)) return denied("Task is not resumable.");
         const admission = await this.admissionReason(db, scope, task.id, 1);
@@ -319,6 +350,8 @@ class SQLiteStore implements Store {
         await db.query("UPDATE jobs SET state='held' WHERE workspace_id=$workspace AND kind='model' AND entity_id=$1", [task.id]);
         await queue(db, scope, task.id, "model", task.id, {}, this.now());
         await event(db, scope, task.id, userId, "task_resumed", { revision: updated.revision }, this.now());
+        await notice(db, scope, updated, "I'll pick this back up.", this.now(), [], "acknowledgement");
+        await progress(db, scope, updated, "I'm continuing the work.", this.now(), 8000);
       }
       return { kind: "accepted", taskId: task.id };
     }
@@ -554,13 +587,16 @@ class SQLiteStore implements Store {
       } else if (name === "status") {
         const task = reference ? (await records(db, "tasks", taskSchema, "scope_id=$1 AND id=$2", [scope.id, reference]))[0] : null;
         receipt = task ? { kind: "accepted", taskId: task.id } : { kind: "denied", message: "Reply to a task or provide one task ID." };
-        if (task) await notice(db, scope, task, `Task ${task.id}: ${task.state}.${task.reason ? ` ${task.reason}` : ""}`, this.now());
+        if (task) await notice(db, scope, task, `Current state: ${task.state.replaceAll("_", " ")}.${task.reason ? ` ${task.reason}` : ""}`, this.now());
       } else if (name === "remember" && argument) receipt = await this.commandIn(db, scope, { scopeId: scope.id, userId: update.userId, key: `telegram:${update.botId}:${update.updateId}`, command: { kind: "remember", content: argument, evidenceIds: [source.id], candidate: false } });
       else if (name === "memory" || name === "routines") {
         const items = name === "memory" ? (await records(db, "memories", memorySchema, "scope_id=$1", [scope.id])).map(memory => `${memory.id} [${memory.state} r${memory.revision}] ${memory.content}`) : (await records(db, "routines", routineSchema, "scope_id=$1", [scope.id])).map(routine => `${routine.id} [${routine.state}] ${routine.instruction}`);
         await notice(db, scope, null, items.join("\n") || `No ${name} in this scope.`, this.now());
         receipt = { kind: "accepted" };
-      } else if (name === "help" || name === "start") { await notice(db, scope, null, "Mention Asmo to start. Reply to a task to steer. Use /status, /stop, /resume, /cancel with a task ID, /memory, /remember, or /routines.", this.now()); receipt = { kind: "accepted" }; }
+      } else if (name === "settings" || name === "configure") {
+        await notice(db, scope, null, "Open Configure to see this group's tools, access, and memory. Group managers can change connections.", this.now(), [], "settings");
+        receipt = { kind: "accepted" };
+      } else if (name === "help" || name === "start") { await notice(db, scope, null, "Mention me with a question or task. Reply to one of my messages to keep working together. Use /settings for tools and access. Reply with /stop, /resume, or /status to control or inspect that work.", this.now()); receipt = { kind: "accepted" }; }
       else receipt = { kind: "denied", message: "Command unavailable or missing argument." };
     } else if (linked || update.mentioned || scope.kind === "dm") {
       const command: Command = linked ? { kind: "steer", taskId: linked, text: update.text || "Use the attached text as task context." } : { kind: "start", instruction: update.text || "Inspect the attached text.", topicId: update.topicId };
@@ -595,8 +631,9 @@ class SQLiteStore implements Store {
         if (admission) {
           const blocked: Task = { ...task, reason: `${admission} Resume after capacity becomes available.` };
           await save(db, "tasks", blocked);
+          await progress(db, scope, blocked, settledProgress(blocked), this.now());
           await event(db, scope, task.id, null, "recovery_admission_blocked", { reason: admission, completedEffectsRetained: true }, this.now());
-          await notice(db, scope, blocked, `Task ${task.id} blocked. ${blocked.reason}`, this.now());
+          await notice(db, scope, blocked, `I can’t continue yet. ${blocked.reason}`, this.now());
           return;
         }
       }
@@ -606,7 +643,7 @@ class SQLiteStore implements Store {
     } else if (task.state === "stopping") {
       const unresolved = await records(db, "effects", effectSchema, "task_id=$1 AND data->>'state' IN ('dispatching','unknown')", [task.id]);
       const model = await rows(db, "SELECT id FROM jobs WHERE workspace_id=$workspace AND task_id=$1 AND kind='model' AND state='leased' AND expires_at>$2", [task.id, this.now()], z.object({ id: z.string() }));
-      if (!unresolved.length && !model.length) { const paused: Task = { ...task, state: "paused", reason: null }; await save(db, "tasks", paused); await event(db, scope, task.id, null, "stop_settled", {}, this.now()); await notice(db, scope, paused, `Task ${task.id} paused. Completed effects retained.`, this.now()); }
+      if (!unresolved.length && !model.length) { const paused: Task = { ...task, state: "paused", reason: null }; await save(db, "tasks", paused); await event(db, scope, task.id, null, "stop_settled", {}, this.now()); await notice(db, scope, paused, "I’ve stopped. Completed actions are retained.", this.now()); }
     }
   }
   async materializeRoutines(): Promise<void> {
@@ -662,12 +699,12 @@ class SQLiteStore implements Store {
     if (grants.some(grant => grant.kind === "notion_scope" && grant.read)) tools.push("notion_search", "notion_read_page");
     return { task, history: await history(db, task.id), sources, memories, collectedSince: scope.collectedSince, tools, maxOutputTokens: this.options.maxOutputTokens };
   }
-  async claim(workerId: string): Promise<Job | null> {
-    await this.materializeRoutines();
+  async claim(workerId: string, kind?: Job["kind"]): Promise<Job | null> {
+    if (kind !== "delivery") await this.materializeRoutines();
     for (let attempt = 0; attempt < 40; attempt += 1) {
       const token = uuid();
       const job = await inDatabaseTransaction(this.connection, async (): Promise<Job | null | undefined> => {
-        const candidates = await this.connection.discover("SELECT workspace_id,scope_id,id FROM jobs WHERE ($2 IS NULL OR workspace_id IN (SELECT value FROM json_each($2))) AND ((state='ready' AND ready_at<=$1) OR (state='leased' AND expires_at<=$1)) ORDER BY CASE kind WHEN 'effect' THEN 0 WHEN 'delivery' THEN 1 ELSE 2 END,ready_at LIMIT 1", [this.now(), this.options.workspaceIds ?? null], locationSchema.extend({ id: z.string() }));
+        const candidates = await this.connection.discover("SELECT workspace_id,scope_id,id FROM jobs WHERE ($2 IS NULL OR workspace_id IN (SELECT value FROM json_each($2))) AND ($3 IS NULL OR kind=$3) AND ((state='ready' AND ready_at<=$1) OR (state='leased' AND expires_at<=$1)) ORDER BY CASE kind WHEN 'effect' THEN 0 WHEN 'delivery' THEN 1 ELSE 2 END,ready_at LIMIT 1", [this.now(), this.options.workspaceIds ?? null, kind ?? null], locationSchema.extend({ id: z.string() }));
         const location = candidates[0];
         if (!location) return undefined;
         const db = this.connection.context(location.workspace_id);
@@ -680,7 +717,12 @@ class SQLiteStore implements Store {
         if (row.kind === "delivery") {
           const delivery = deliverySchema.parse(row.data);
           if (!scope.active || (task && !await this.requesterAllowed(db, scope, task))) { await db.query("UPDATE jobs SET state='held' WHERE workspace_id=$workspace AND id=$1", [row.id]); await event(db, scope, task?.id ?? null, null, "delivery_held", { reason: "Current destination or requester access unavailable." }, this.now()); return null; }
-          return { kind: "delivery", lease, delivery: { ...delivery, chatId: scope.chatId } };
+          if (delivery.purpose === "progress" && task && task.state !== "queued" && task.state !== "running") {
+            if (delivery.messageId === null) { await db.query("UPDATE jobs SET state='done' WHERE workspace_id=$workspace AND id=$1", [row.id]); return null; }
+            delivery.buttons = []; delivery.text = settledProgress(task);
+          }
+          const incoming = task ? (await rows(db, "SELECT message_id FROM messages WHERE workspace_id=$workspace AND scope_id=$1 AND chat_id=$2 AND task_id=$3 AND source_id IS NOT NULL ORDER BY message_id DESC LIMIT 1", [scope.id, scope.chatId, task.id], z.object({ message_id: z.number().int() })))[0] : undefined;
+          return { kind: "delivery", lease, delivery: { ...delivery, chatId: scope.chatId, ...(delivery.replyTo === undefined && incoming ? { replyTo: incoming.message_id } : {}) } };
         }
         if (!task) throw new Error("Job task unavailable");
         if (row.kind === "effect") {
@@ -715,9 +757,10 @@ class SQLiteStore implements Store {
         if (task.turns >= task.maxTurns || workspace.held + workspace.spent + amount > workspace.budget || scopeTotals.held + scopeTotals.spent + amount > scope.budgetMicros || taskTotals.held + taskTotals.spent + amount > task.budgetMicros) {
           const blocked: Task = { ...task, state: "blocked", reason: task.turns >= task.maxTurns ? "Task turn limit reached." : "Budget reservation unavailable." };
           await save(db, "tasks", blocked);
+          await progress(db, scope, blocked, settledProgress(blocked), this.now());
           await db.query("UPDATE jobs SET state='held' WHERE workspace_id=$workspace AND id=$1", [row.id]);
           await event(db, scope, task.id, null, "budget_blocked", { reserveMicros: amount, turnLimit: task.maxTurns }, this.now());
-          await notice(db, scope, blocked, `Task ${task.id} blocked. ${blocked.reason}`, this.now());
+          await notice(db, scope, blocked, `I can’t continue yet. ${blocked.reason}`, this.now());
           return null;
         }
         const running: Task = { ...task, state: "running", turns: task.turns + 1, reason: null };
@@ -792,8 +835,9 @@ class SQLiteStore implements Store {
           await append(db, task, { role: "user", content: uses.map(use => ({ type: "tool_result", tool_use_id: use.id, content: "Workspace queue capacity prevented preparing this tool.", is_error: true })) });
           const blocked: Task = { ...progressed, state: "blocked", reason: "Workspace pending-job limit reached. Resume after capacity becomes available." };
           await save(db, "tasks", blocked);
+          await progress(db, scope, blocked, settledProgress(blocked), this.now());
           await event(db, scope, task.id, null, "queue_capacity_blocked", { kind: "effect", limit: pendingJobLimitPerWorkspace }, this.now());
-          await notice(db, scope, blocked, `Task ${task.id} blocked. ${blocked.reason}`, this.now());
+          await notice(db, scope, blocked, `I can’t continue yet. ${blocked.reason}`, this.now());
           return;
         }
         const invalid: Transcript["content"] = [];
@@ -817,7 +861,13 @@ class SQLiteStore implements Store {
         if (invalid.length) await append(db, task, { role: "user", content: invalid });
         const effects = await records(db, "effects", effectSchema, "task_id=$1 AND sequence=$2", [task.id, sequence]);
         const persisted = await taskRecord(db, scope.id, task.id);
-        if (persisted.state !== "blocked") await save(db, "tasks", { ...progressed, state: effects.some(effect => effect.state === "waiting_for_approval") ? "waiting_for_approval" : "running" });
+        if (persisted.state !== "blocked") {
+          const working: Task = { ...progressed, state: effects.some(effect => effect.state === "waiting_for_approval") ? "waiting_for_approval" : "running" };
+          await save(db, "tasks", working);
+          const call = effects.find(effect => effect.state === "ready")?.call;
+          const stage = call?.name === "github_read_issues" ? `I'm reading the issues in ${call.input.repository}.` : call?.name === "notion_search" ? "I'm searching the connected Notion pages." : call?.name === "notion_read_page" ? "I'm reading the selected Notion page." : "I'm checking the tool results.";
+          await progress(db, scope, working, working.state === "running" ? stage : settledProgress(working), this.now());
+        }
         await this.advance(db, scope, progressed);
         return;
       }
@@ -831,13 +881,16 @@ class SQLiteStore implements Store {
       const completed: Task = { ...progressed, state: result.outcome === "complete" ? "completed" : result.outcome === "needs_input" ? "waiting_for_input" : "failed", result: { text, sourceIds: cited, limitations }, reason: result.outcome === "incomplete" ? "Provider output incomplete. Resume after checking the limit or refusal." : null };
       await save(db, "tasks", completed);
       await event(db, scope, task.id, null, "model_turn_committed", { outcome: result.outcome, sourceIds: cited, turns: completed.turns }, this.now());
-      await notice(db, scope, completed, `Task ${task.id}: ${completed.state}\n${text}${limitations.length ? `\nLimitations: ${limitations.join("; ")}` : ""}`, this.now());
+      await progress(db, scope, completed, settledProgress(completed), this.now());
+      await notice(db, scope, completed, conversationAnswer(text, limitations, scope.collectedSince), this.now(), [], undefined, "markdown");
     });
   }
   async blockModel(db: Db, scope: Scope, task: Task, reason: string): Promise<void> {
-    await save(db, "tasks", { ...task, state: "failed", reason });
+    const failed: Task = { ...task, state: "failed", reason };
+    await save(db, "tasks", failed);
+    await progress(db, scope, failed, settledProgress(failed), this.now());
     await event(db, scope, task.id, null, "model_output_invalid", { reason }, this.now());
-    await notice(db, scope, task, `Task ${task.id} failed. ${reason}`, this.now());
+    await notice(db, scope, task, `I couldn’t finish this. ${reason}`, this.now());
   }
   async effectJobValid(db: Db, job: Extract<Job, { kind: "effect" }>): Promise<boolean> {
     const dispatched = await rows(db, "SELECT effect_id FROM dispatches WHERE workspace_id=$workspace AND token=$1 AND effect_id=$2", [job.lease.token, job.effect.id], z.object({ effect_id: z.string() }));
@@ -862,7 +915,7 @@ class SQLiteStore implements Store {
       await db.query("UPDATE jobs SET state='done' WHERE workspace_id=$workspace AND kind='effect' AND entity_id=$1", [effect.id]);
       await event(db, scope, task.id, null, "effect_succeeded", { effectId: effect.id, providerId: succeeded.providerId, url: succeeded.url, sourceId: source.id, redacted, late: task.revision !== effect.taskRevision }, this.now());
       await this.advance(db, scope, task);
-      if (["paused", "stopping", "canceled"].includes(task.state)) await notice(db, scope, task, `Task ${task.id}: completed external effect retained.${succeeded.url ? ` ${succeeded.url}` : ""}`, this.now());
+      if (["paused", "stopping", "canceled"].includes(task.state)) await notice(db, scope, task, `The action completed before stopping and is retained.${succeeded.url ? ` ${succeeded.url}` : ""}`, this.now());
     });
   }
   async unknownEffect(job: Extract<Job, { kind: "effect" }>, _reason: string): Promise<void> {
@@ -872,7 +925,12 @@ class SQLiteStore implements Store {
       if (effect.state === "succeeded") return;
       const task = await taskRecord(db, scope.id, effect.taskId);
       await save(db, "effects", { ...effect, state: "unknown", reason: "External outcome is unknown; reconcile before retry." });
-      if (liveStates.has(task.state)) await save(db, "tasks", { ...task, state: "blocked", reason: "External outcome unknown. Reconciliation required." });
+      if (liveStates.has(task.state)) {
+        const blocked: Task = { ...task, state: "blocked", reason: "External outcome unknown. Reconciliation required." };
+        await save(db, "tasks", blocked);
+        await progress(db, scope, blocked, settledProgress(blocked), this.now());
+        await notice(db, scope, blocked, "I couldn't confirm the external action's outcome. I'll check it before any retry; I won't repeat the action blindly.", this.now());
+      }
       const row = (await rows(db, "SELECT * FROM jobs WHERE workspace_id=$workspace AND id=$1", [job.lease.id], jobRowSchema))[0];
       if (row?.token === job.lease.token) await db.query("UPDATE jobs SET state=$3,ready_at=$4 WHERE workspace_id=$workspace AND id=$1 AND token=$2", [job.lease.id, job.lease.token, (row.attempts < 4) ? "ready" : "held", this.now() + Math.min(60_000, 1000 * 2 ** row.attempts)]);
       await event(db, scope, task.id, null, "effect_unknown", { effectId: effect.id, dispatchBlocked: true }, this.now());
@@ -900,6 +958,10 @@ class SQLiteStore implements Store {
       await db.query("UPDATE jobs SET state='done',data=$3 WHERE workspace_id=$workspace AND id=$1 AND token=$2", [job.lease.id, job.lease.token, JSON.stringify({ ...job.delivery, messageId })]);
       await db.query("INSERT INTO messages(workspace_id,scope_id,chat_id,message_id,task_id) VALUES($1,$2,$3,$4,$5) ON CONFLICT(workspace_id,scope_id,chat_id,message_id) DO UPDATE SET task_id=$5", [scope.workspaceId, scope.id, job.delivery.chatId, messageId, job.delivery.taskId]);
       await event(db, scope, job.delivery.taskId, null, "delivery_succeeded", { deliveryId: job.delivery.id, messageId }, this.now());
+      if (job.delivery.purpose === "progress" && job.delivery.taskId) {
+        const task = await taskRecord(db, scope.id, job.delivery.taskId);
+        if (task.state !== "queued" && task.state !== "running" && job.delivery.buttons.length) await progress(db, scope, task, settledProgress(task), this.now());
+      }
     });
   }
   async fail(job: Job, _reason: string): Promise<void> {
@@ -920,8 +982,9 @@ class SQLiteStore implements Store {
       if (task.epoch !== job.input.task.epoch || task.state === "stopping" || task.state === "canceled") { await this.advance(db, scope, task); return; }
       const failed: Task = { ...task, state: "failed", reason: "Model call failed. Usage is conservatively estimated until a receipt arrives." };
       await save(db, "tasks", failed);
+      await progress(db, scope, failed, settledProgress(failed), this.now());
       await event(db, scope, task.id, null, "model_failed", { reason: failed.reason, estimatedMicros: this.options.modelReserveMicros }, this.now());
-      await notice(db, scope, failed, `Task ${task.id} failed. Check provider configuration, then resume.`, this.now());
+      await notice(db, scope, failed, "I couldn’t finish because the model call failed. Check the provider configuration, then reply with /resume to try again.", this.now());
     });
   }
   async close(): Promise<void> {

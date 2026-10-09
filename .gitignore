@@ -1,20 +1,53 @@
+# deps
 node_modules/
+.pnpm-store/
+
+# build output
 dist/
+*.tsbuildinfo
 coverage/
+.nyc_output/
+
+# env and secrets, keep the example tracked
 .env
 .env.*
 !.env.example
-work/postgres-data/
-work/postgres-socket/
-work/*.log
-work/*.pid
-work/evidence/
-work/fixtures/
+
+# local runtime and agent scratch
 work/
 .learnings/
-.DS_Store
 
+# sqlite artifacts
 *.sqlite
 *.sqlite-journal
 *.sqlite-wal
 *.sqlite-shm
+
+# logs and temp
+*.log
+*.pid
+
+# os
+.DS_Store
+Thumbs.db
+
+# editors
+.vscode/
+.idea/
+
+# ai agent local state, keep AGENTS.md tracked
+.claude/
+.codex/
+.cursor/
+.opencode/
+.windsurf/
+.aider*
+.cline/
+.continue/
+.copilot/
+.gemini/
+.qwen/
+.factory/
+.agents/
+.replit
+AGENTS.md

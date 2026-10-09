@@ -2,6 +2,8 @@ import { z } from "zod";
 import { memorySchema, sourceSchema, taskSchema, transcriptSchema } from "../core.js";
 import type { ToolName } from "../core.js";
 
+export const responseFormattingInstructions = "Replies use Telegram Rich Markdown. Use GitHub Flavored Markdown when it helps: headings, lists, tables, block quotes, and fenced code. Keep short replies simple. Do not emit raw HTML, media embeds, or inline action buttons. Put literal HTML and media syntax inside fenced code. Preserve the exact [Source: ID] citation syntax and the required Needs input: prefix.";
+
 export const toolDescriptions: Record<ToolName, string> = {
   github_read_issues: "Read issues from the approved repository.",
   github_create_issue: "Propose an exact issue for application approval before creation.",

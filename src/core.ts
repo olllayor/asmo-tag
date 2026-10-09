@@ -80,6 +80,8 @@ export const taskSchema = z.object({
 export type Task = z.infer<typeof taskSchema>;
 
 export const toolInputs = {
+  notion_search: z.object({ query: z.string().min(1).max(1000) }).strict(),
+  notion_read_page: z.object({ pageId: z.uuid() }).strict(),
   github_read_issues: z.object({ repository: z.string().regex(/^[\w.-]+\/[\w.-]+$/) }).strict(),
   github_create_issue: z
     .object({
@@ -92,6 +94,8 @@ export const toolInputs = {
 };
 export type ToolName = keyof typeof toolInputs;
 export const toolCallSchema = z.discriminatedUnion('name', [
+  z.object({ id, name: z.literal('notion_search'), input: toolInputs.notion_search }),
+  z.object({ id, name: z.literal('notion_read_page'), input: toolInputs.notion_read_page }),
   z.object({ id, name: z.literal('github_read_issues'), input: toolInputs.github_read_issues }),
   z.object({ id, name: z.literal('github_create_issue'), input: toolInputs.github_create_issue }),
 ]);
@@ -106,10 +110,18 @@ export const blockSchema = z.discriminatedUnion('type', [
     is_error: z.boolean().default(false),
   }),
 ]);
-export const transcriptSchema = z.object({ role: z.enum(['user', 'assistant']), content: z.array(blockSchema) });
+export const transcriptSchema = z.object({
+  role: z.enum(['user', 'assistant']), content: z.array(blockSchema),
+  providerState: z.object({
+    protocol: z.literal('responses'), provider: z.enum(['openai', 'deepseek']),
+    endpoint: z.string(), model: z.string(), items: z.array(z.json()).max(128),
+  }).optional(),
+});
 export type Transcript = z.infer<typeof transcriptSchema>;
 export const usageSchema = z.object({
   inputTokens: z.number().int().nonnegative(),
+  cachedInputTokens: z.number().int().nonnegative().optional(),
+  reasoningOutputTokens: z.number().int().nonnegative().optional(),
   outputTokens: z.number().int().nonnegative(),
   costMicros: micros,
   simulated: z.boolean(),
@@ -135,6 +147,8 @@ export const effectSchema = z.object({
   taskRevision: z.number().int(),
   policyRevision: z.number().int(),
   grantRevision: z.number().int(),
+  connectionId: id.optional(),
+  connectionVersion: z.number().int().positive().optional(),
   hash: z.string(),
   result: z.string().nullable(),
   providerId: z.string().nullable(),
@@ -153,6 +167,7 @@ export const approvalSchema = z.object({
 });
 export type Approval = z.infer<typeof approvalSchema>;
 export const grantSchema = z.object({
+  kind: z.literal('github_repository').optional(),
   id,
   scopeId: id,
   repository: z.string(),
@@ -160,7 +175,14 @@ export const grantSchema = z.object({
   write: z.boolean(),
   active: z.boolean(),
   revision: z.number().int().positive(),
-});
+  connectionId: id.optional(),
+  connectionVersion: z.number().int().positive().optional(),
+}).or(z.object({
+  kind: z.literal('notion_scope'), id, scopeId: id,
+  repository: z.literal('').default(''), read: z.boolean(), write: z.literal(false).default(false),
+  active: z.boolean(), revision: z.number().int().positive(),
+  connectionId: id, connectionVersion: z.number().int().positive(), notionWorkspaceId: id,
+}));
 export type Grant = z.infer<typeof grantSchema>;
 export const routineSchema = z.object({
   id,
@@ -324,6 +346,8 @@ export type Delivery = {
   buttons: { text: string; data: string }[];
   messageId: number | null;
   replyTo?: number;
+  format?: 'markdown';
+  purpose?: 'acknowledgement' | 'progress' | 'settings';
 };
 export interface Messenger {
   readonly simulated: boolean;
@@ -335,6 +359,9 @@ export type Job =
   | { kind: 'effect'; lease: Lease; effect: Effect; reconcile: boolean }
   | { kind: 'delivery'; lease: Lease; delivery: Delivery };
 export interface Store {
+  connectRepositoryGrants(scopeId: string, userId: string, connectionId: string, connectionVersion: number, repositories: string[]): Promise<void>;
+  connectNotionGrant(scopeId: string, userId: string, connectionId: string, connectionVersion: number, notionWorkspaceId: string): Promise<void>;
+  disconnectRepositoryGrants(scopeId: string, userId: string, connectionId: string): Promise<void>;
   seed(input: Seed): Promise<void>;
   ingest(update: NormalizedUpdate): Promise<Receipt>;
   command(input: CommandInput): Promise<Receipt>;
@@ -343,7 +370,8 @@ export interface Store {
   scopes(userId: string): Promise<Scope[]>;
   resolveChat(botId: string, chatId: string): Promise<Scope | null>;
   membership(scopeId: string, userId: string, role: z.infer<typeof roleSchema> | null): Promise<void>;
-  claim(workerId: string): Promise<Job | null>;
+  claim(workerId: string, kind?: Job['kind']): Promise<Job | null>;
+  materializeRoutines(): Promise<void>;
   finishModel(job: Extract<Job, { kind: 'model' }>, result: Turn): Promise<void>;
   finishEffect(job: Extract<Job, { kind: 'effect' }>, receipt: ConnectorReceipt): Promise<void>;
   unknownEffect(job: Extract<Job, { kind: 'effect' }>, reason: string): Promise<void>;
@@ -353,7 +381,8 @@ export interface Store {
   close(): Promise<void>;
 }
 export type StoreOptions = {
-  databaseUrl: string;
+  databasePath: string;
+  workspaceIds?: string[];
   modelReserveMicros: number;
   maxOutputTokens: number;
   maxTurns: number;

@@ -9,6 +9,7 @@
   },
   "packageManager": "pnpm@12.9.1",
   "scripts": {
+    "start:live": "node --env-file=.env.live dist/main.js serve",
     "dev": "tsx src/main.ts serve",
     "demo": "tsx src/main.ts demo",
     "db:migrate": "tsx src/main.ts migrate",
