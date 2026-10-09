@@ -28,6 +28,8 @@ Configuration presence validation passed for Telegram, the model, GitHub, Notion
 
 Existing pilot documents name the daily-driver `Asmo Tag Dev` group and `olllayor/asmo-tag`. They are not assumed to be disposable destinations. The live gate needs a selected test repository and chat, an exact reviewed title/body/labels, and a model-spend bound. Revocation and process-death tests must use an isolated application database and connection.
 
+The [prepared live procedure](wave1-live-check.md) supplies exact synthetic messages, issue payloads, expected callback decisions, and isolated revocation/restart checks. Resource selection and spend remain pending. It does not claim that a normal restart proves live lost-receipt recovery.
+
 ## Local recovery proof
 
 Source commit `ea02a5d40918e295b1a1aa7833e230d901bb61d2` passed 143 tests across 11 files, `pnpm check`, and an isolated backend compile. The baseline also passed `pnpm web:check` and an isolated web build. Build output went under `work/wave1`, outside the daily-driver build paths.
