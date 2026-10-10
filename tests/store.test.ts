@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { Command, Job, NormalizedUpdate, Scope, Seed, Store, StoreOptions, Turn } from "../src/core.js";
+import { nextWallClockInstant, wallClockInstant, type Command, type Job, type NormalizedUpdate, type Scope, type Seed, type Store, type StoreOptions, type Turn } from "../src/core.js";
 import { openStore } from "../src/store/index.js";
 import { createResponsesModel } from "../src/providers/responses.js";
 import { contextCoverageLimitation } from "../src/conversation.js";
@@ -543,6 +543,71 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     expect(view.effects[0]?.providerId).toBe("found-original");
     expect(view.events.filter(event => event.kind === "effect_dispatched")).toHaveLength(1);
     expect(JSON.stringify(view)).not.toContain("NEVER_LOG_THIS_SECRET");
+  });
+
+  it("retains confirmed effect and stays blocked when recovery resumption hits pending-job capacity", async () => {
+    const draft = await draftWrite();
+    await command({ kind: "decide", approvalId: draft.approval.id, decision: "approve" }, "manager");
+    const dispatched = await claimEffect();
+    await store.unknownEffect(dispatched, "Outcome awaiting positive reconciliation");
+    const held = await store.task(scope.id, "member", draft.taskId);
+    expect(held.task.state).toBe("blocked");
+    expect(held.task.reason).toBe("External outcome unknown. Reconciliation required.");
+
+    const probe = new DatabaseSync(options.databasePath);
+    try {
+      probe.prepare("UPDATE jobs SET state='held' WHERE id=?").run(dispatched.lease.id);
+    } finally {
+      probe.close();
+    }
+
+    const filler = await start("Recovery capacity filler");
+    for (let index = 0; index < 500; index += 1) {
+      expect((await command({ kind: "stop", taskId: filler })).kind).toBe("accepted");
+    }
+
+    await store.finishEffect(dispatched, { providerId: "write-confirmed-at-capacity", url: null, content: "Positively confirmed at capacity" });
+    const recoveryBlocked = await store.task(scope.id, "member", draft.taskId);
+    expect(recoveryBlocked.task.state).toBe("blocked");
+    expect(recoveryBlocked.task.reason).toContain("Workspace pending-job limit reached.");
+    expect(recoveryBlocked.effects[0]?.state).toBe("succeeded");
+    expect(recoveryBlocked.effects[0]?.providerId).toBe("write-confirmed-at-capacity");
+    expect(recoveryBlocked.events.some(event => event.kind === "recovery_admission_blocked")).toBe(true);
+  });
+
+  it("resolves nonexistent local times across spring-forward DST gap without stalling", () => {
+    const tz = "America/New_York";
+    const start = Date.UTC(2026, 2, 8, 6, 30);
+    const first = nextWallClockInstant(start, 3_600_000, tz);
+    expect(first).toBe(Date.UTC(2026, 2, 8, 7, 0));
+    expect(first).toBeGreaterThan(start);
+    const second = nextWallClockInstant(first, 3_600_000, tz);
+    expect(second).toBe(Date.UTC(2026, 2, 8, 8, 0));
+    expect(second).toBeGreaterThan(first);
+
+    const explicit = wallClockInstant("2026-03-08T02:30", tz);
+    expect(explicit).toBe(Date.UTC(2026, 2, 8, 7, 0));
+  });
+
+  it("skips backlog tasks and advances nextAt when routine is more than 50 intervals overdue", async () => {
+    const intervalMs = 86_400_000;
+    const staleNextAt = now - 60 * intervalMs;
+    await command({ kind: "create_routine", instruction: "Overdue digest", timezone: "America/New_York", nextAt: staleNextAt, intervalMs, budgetMicros: 5000 }, "manager");
+    const beforeView = await store.view(scope.id, "member");
+    const routineId = beforeView.routines.find(r => r.instruction === "Overdue digest")!.id;
+
+    await store.materializeRoutines();
+
+    const afterView = await store.view(scope.id, "member");
+    const updatedRoutine = afterView.routines.find(r => r.id === routineId)!;
+    expect(updatedRoutine.nextAt).toBeGreaterThan(now);
+    expect(afterView.tasks.filter(t => t.task.instruction === "Overdue digest")).toHaveLength(0);
+
+    const probe = new DatabaseSync(options.databasePath);
+    try {
+      const skipped = probe.prepare("SELECT count(*) AS count FROM events WHERE workspace_id=? AND json_extract(data, '$.kind') = 'routine_backlog_skipped'").get(seed.workspaceId) as { count: number } | undefined;
+      expect(skipped?.count).toBe(1);
+    } finally { probe.close(); }
   });
 
   it("resumes a recovered effect with one dispatch and the confirmed result in history", async () => {

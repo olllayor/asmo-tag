@@ -253,7 +253,7 @@ export const commandSchema = z.discriminatedUnion('kind', [
     instruction: z.string().min(1).max(4000),
     timezone: z.string(),
     nextAt: z.number(),
-    intervalMs: z.number().int().min(60000),
+    intervalMs: z.number().int().min(60000).max(366 * 86_400_000),
     budgetMicros: micros,
   }),
   z.object({ kind: z.literal('set_routine'), routineId: id, state: z.enum(['active', 'paused', 'revoked']) }),
@@ -417,12 +417,29 @@ function wallClockOffsetMs(instant: number, timeZone: string): number {
   return wallAsUtc - Math.floor(instant / 1000) * 1000;
 }
 
+function resolveWallClockInstant(wallAsUtc: number, timeZone: string): number {
+  const firstPass = wallAsUtc - wallClockOffsetMs(wallAsUtc, timeZone);
+  const candidate = wallAsUtc - wallClockOffsetMs(firstPass, timeZone);
+  const candidateWall = candidate + wallClockOffsetMs(candidate, timeZone);
+  if (candidateWall < wallAsUtc) {
+    const targetOffset = wallClockOffsetMs(firstPass, timeZone);
+    let low = candidate;
+    let high = firstPass;
+    while (low < high) {
+      const mid = Math.floor((low + high) / 2);
+      if (wallClockOffsetMs(mid, timeZone) === targetOffset) high = mid;
+      else low = mid + 1;
+    }
+    return low;
+  }
+  return candidate;
+}
+
 /** Instant of the next wall-clock occurrence, derived in timeZone rather than in UTC. */
 export function nextWallClockInstant(from: number, intervalMs: number, timeZone: string): number {
   const shifted = new Date(from + wallClockOffsetMs(from, timeZone) + intervalMs);
   const wallAsUtc = Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth(), shifted.getUTCDate(), shifted.getUTCHours(), shifted.getUTCMinutes(), shifted.getUTCSeconds(), shifted.getUTCMilliseconds());
-  const firstPass = wallAsUtc - wallClockOffsetMs(wallAsUtc, timeZone);
-  return wallAsUtc - wallClockOffsetMs(firstPass, timeZone);
+  return resolveWallClockInstant(wallAsUtc, timeZone);
 }
 
 /** Instant for a datetime-local value ("YYYY-MM-DDTHH:mm") read as wall-clock time in timeZone. */
@@ -430,6 +447,5 @@ export function wallClockInstant(value: string, timeZone: string): number {
   const parsed = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(value);
   if (!parsed) throw new Error("Choose a valid local date and time.");
   const wallAsUtc = Date.UTC(Number(parsed[1]), Number(parsed[2]) - 1, Number(parsed[3]), Number(parsed[4]), Number(parsed[5]));
-  const firstPass = wallAsUtc - wallClockOffsetMs(wallAsUtc, timeZone);
-  return wallAsUtc - wallClockOffsetMs(firstPass, timeZone);
+  return resolveWallClockInstant(wallAsUtc, timeZone);
 }

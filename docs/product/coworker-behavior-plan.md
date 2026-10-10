@@ -16,7 +16,7 @@ A teammate can reply to the answer or progress to continue the same work. Preser
 
 Use a deliberate settings entry, such as /settings, with an authorized Mini App link. Offer access setup when it blocks the requested outcome. Keep manager checks in the application rather than treating a natural-language claim as permission.
 
-## What the current code does
+## Baseline behavior before Wave-1 adaptation
 
 - `src/store/index.ts`, `createTask`, sends an acceptance receipt with the task UUID and Stop for every request.
 - `src/store/index.ts`, `finishModel`, prefixes the final answer with task state and appends all limitations.

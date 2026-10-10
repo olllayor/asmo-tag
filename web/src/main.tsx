@@ -267,17 +267,47 @@ function Memories({ view, busy, mutate, manager }: { view: WorkspaceView; busy: 
   return <section className="content-section"><div className="section-heading"><h2>Scoped memory</h2><span>{view.memories.length} notes</span></div><p className="muted">Notes belong to this scope. Automatic memory is not enabled. Inspect and correct saved facts here.</p>{view.memories.length === 0 && <p className="empty">No memory saved yet.</p>}{view.memories.map(memory => <MemoryRecord memory={memory} key={memory.id} busy={busy} mutate={mutate} />)}<form className="section-form" onSubmit={event => void submit(event)}><h3>Remember a stable fact</h3><label htmlFor="memory-content">Fact or instruction</label><textarea id="memory-content" required maxLength={4000} value={text} onChange={event => setText(event.target.value)} /><label htmlFor="memory-evidence">Evidence source IDs, separated by commas</label><input id="memory-evidence" value={evidence} onChange={event => setEvidence(event.target.value)} placeholder="Optional" /><button disabled={busy || !text.trim()}>Save memory</button></form>{manager && <div className="section-form"><h3>Forget captured sources</h3><p className="small muted">Invalidates selected source records and dependent retrieval. This is not a promise to remove provider copies or every backup.</p><label htmlFor="forget-sources">Source IDs in this scope</label><input id="forget-sources" value={sourceIds} disabled={busy || confirm} onChange={event => setSourceIds(event.target.value)} /><button disabled={busy || ids(sourceIds).length === 0 || confirm} onClick={() => setConfirm(true)}>Review source removal</button>{confirm && <div className="confirmation"><p>Forget these exact sources: <span className="mono">{ids(sourceIds).join(", ")}</span></p><div className="action-row"><button disabled={busy} onClick={() => { void mutate({ kind: "forget_sources", sourceIds: ids(sourceIds) }).then(ok => { if (ok) { setConfirm(false); setSourceIds(""); } }); }}>Confirm removal</button><button disabled={busy} onClick={() => setConfirm(false)}>Cancel</button></div></div>}</div>}</section>;
 }
 
+function localDatetimeValue(instant: number, timeZone: string): string {
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      hourCycle: "h23",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    }).formatToParts(new Date(instant));
+    const read = (type: Intl.DateTimeFormatPartTypes) => parts.find(p => p.type === type)?.value ?? "";
+    return `${read("year")}-${read("month")}-${read("day")}T${read("hour")}:${read("minute")}`;
+  } catch {
+    return new Date(instant).toISOString().slice(0, 16);
+  }
+}
+
+function routineDate(at: number, timeZone: string): string {
+  try {
+    return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short", timeZone }).format(at) + ` (${timeZone})`;
+  } catch {
+    return date(at);
+  }
+}
+
 function Routines({ view, busy, mutate, manager }: { view: WorkspaceView; busy: boolean; mutate: Mutate; manager: boolean }) {
   const [instruction, setInstruction] = useState("");
   const [timezone, setTimezone] = useState(view.scope.timezone);
-  const [next, setNext] = useState(new Date(Date.now() + 86400000).toISOString().slice(0, 16));
+  const [next, setNext] = useState(() => localDatetimeValue(Date.now() + 86400000, view.scope.timezone));
+  useEffect(() => {
+    setTimezone(view.scope.timezone);
+    setNext(localDatetimeValue(Date.now() + 86400000, view.scope.timezone));
+  }, [view.scope.id, view.scope.timezone]);
   const [budget, setBudget] = useState("0.50");
   const [error, setError] = useState("");
   const submit = async (event: FormEvent) => {
     event.preventDefault(); setError("");
     try { new Intl.DateTimeFormat("en", { timeZone: timezone }).format(); const nextAt = wallClockInstant(next, timezone); if (nextAt <= Date.now()) throw new Error("Choose a future next run."); if (await mutate({ kind: "create_routine", instruction: instruction.trim(), timezone, nextAt, intervalMs: 86400000, budgetMicros: amount(budget) })) setInstruction(""); } catch (cause) { setError(cause instanceof Error ? cause.message : "Check the schedule and allowance."); }
   };
-  return <section className="content-section"><div className="section-heading"><h2>Standing work</h2><span>{view.routines.length} routines</span></div>{!view.routines.length && <p className="empty">No routines configured.</p>}{view.routines.map(routine => <div className="routine-record" key={routine.id}><div className="section-heading"><h3>{routine.instruction}</h3><span>{routine.state}</span></div><dl className="setting-list"><div><dt>Next run</dt><dd>{date(routine.nextAt)}</dd></div><div><dt>Input timezone</dt><dd>{routine.timezone}</dd></div><div><dt>Interval</dt><dd>{routine.intervalMs / 60000} minutes</dd></div><div><dt>Run allowance</dt><dd>{dollars(routine.budgetMicros)}{view.usage.simulated ? " · Simulated" : ""}</dd></div></dl>{manager && routine.state !== "revoked" && <div className="action-row"><button disabled={busy} onClick={() => void mutate({ kind: "set_routine", routineId: routine.id, state: routine.state === "active" ? "paused" : "active" })}>{routine.state === "active" ? "Pause routine" : "Resume routine"}</button></div>}</div>)}{manager ? <form className="section-form" onSubmit={event => void submit(event)}><h3>Create a routine</h3><label htmlFor="routine-instruction">Standing instruction</label><textarea id="routine-instruction" required maxLength={4000} value={instruction} onChange={event => setInstruction(event.target.value)} /><div className="form-grid"><label>Input timezone<input value={timezone} onChange={event => setTimezone(event.target.value)} required placeholder="Etc/UTC" /></label><label>Next run, local time<input type="datetime-local" value={next} onChange={event => setNext(event.target.value)} required /></label><div><span className="small muted">Frequency</span><p>Daily at a fixed local time</p></div><label>Run allowance, USD<input type="number" min="0" step="0.000001" value={budget} onChange={event => setBudget(event.target.value)} required /></label></div><p className="small muted">Runs at the same local time in the selected timezone, including across daylight saving changes. Uses this scope's shared tools. Personal connectors are unavailable.</p>{error && <p role="alert" className="message">{error}</p>}<button disabled={busy || !instruction.trim()}>Create displayed schedule</button></form> : <p className="muted">Pilot routine changes require a manager or owner.</p>}</section>;
+  return <section className="content-section"><div className="section-heading"><h2>Standing work</h2><span>{view.routines.length} routines</span></div>{!view.routines.length && <p className="empty">No routines configured.</p>}{view.routines.map(routine => <div className="routine-record" key={routine.id}><div className="section-heading"><h3>{routine.instruction}</h3><span>{routine.state}</span></div><dl className="setting-list"><div><dt>Next run</dt><dd>{routineDate(routine.nextAt, routine.timezone)}</dd></div><div><dt>Input timezone</dt><dd>{routine.timezone}</dd></div><div><dt>Interval</dt><dd>{routine.intervalMs / 60000} minutes</dd></div><div><dt>Run allowance</dt><dd>{dollars(routine.budgetMicros)}{view.usage.simulated ? " · Simulated" : ""}</dd></div></dl>{manager && routine.state !== "revoked" && <div className="action-row"><button disabled={busy} onClick={() => void mutate({ kind: "set_routine", routineId: routine.id, state: routine.state === "active" ? "paused" : "active" })}>{routine.state === "active" ? "Pause routine" : "Resume routine"}</button></div>}</div>)}{manager ? <form className="section-form" onSubmit={event => void submit(event)}><h3>Create a routine</h3><label htmlFor="routine-instruction">Standing instruction</label><textarea id="routine-instruction" required maxLength={4000} value={instruction} onChange={event => setInstruction(event.target.value)} /><div className="form-grid"><label>Input timezone<input value={timezone} onChange={event => setTimezone(event.target.value)} required placeholder="Etc/UTC" /></label><label>Next run, local time<input type="datetime-local" value={next} onChange={event => setNext(event.target.value)} required /></label><div><span className="small muted">Frequency</span><p>Daily at a fixed local time</p></div><label>Run allowance, USD<input type="number" min="0" step="0.000001" value={budget} onChange={event => setBudget(event.target.value)} required /></label></div><p className="small muted">Runs at the same local time in the selected timezone, including across daylight saving changes. Uses this scope's shared tools. Personal connectors are unavailable.</p>{error && <p role="alert" className="message">{error}</p>}<button disabled={busy || !instruction.trim()}>Create displayed schedule</button></form> : <p className="muted">Pilot routine changes require a manager or owner.</p>}</section>;
 }
 
 function Administration({ view, busy, mutate }: { view: WorkspaceView; busy: boolean; mutate: Mutate }) {

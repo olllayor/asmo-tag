@@ -113,7 +113,7 @@ Reuse an existing suitable registration if one exists. Do not rotate its secret.
 
 Sources: [Notion public connections](https://developers.notion.com/guides/get-started/public-connections) and [connection capabilities](https://developers.notion.com/reference/capabilities).
 
-After approval, save only the three Notion operator fields privately while preserving all existing environment values and the vault key. Identify the established service supervisor, then name and obtain approval for one live restart before performing it. The supervisor was not identified in this run.
+After approval, save only the three Notion operator fields privately while preserving all existing environment values and the vault key. Identify the established service supervisor, then name and obtain approval for one live restart before performing it. (In this pilot run, no launchd service supervisor was found; the live service was restarted as an approved detached Node process replacement from PID 64017 to PID 82439.)
 
 After group authorization, seek approval to send this exact read-test message:
 
