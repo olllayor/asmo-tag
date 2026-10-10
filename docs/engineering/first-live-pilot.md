@@ -25,6 +25,8 @@ Choose a current model ID and its verified uncached-input, cached-input, and out
 
 The CLI also reads `.env` if present. Explicit values loaded by Node's `--env-file=.env.live` take precedence. Keep the pilot database and port explicit.
 
+After building, `npm run start:live` runs the same live command without the global pnpm launcher. Blank numeric settings are invalid, including the task budget and model reservation. Set the approved task budget and a reservation that meets the configured request bound. Set all three token prices from the selected provider's current model documentation. Startup reports invalid numeric setting names without printing their values.
+
 ## Run one bounded task
 
 Post synthetic evidence in the test group after activation. Mention the actual bot username with this request, replacing the repository and pilot marker:
