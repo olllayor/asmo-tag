@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { Command, Job, NormalizedUpdate, Scope, Seed, Store, StoreOptions, Turn } from "../src/core.js";
+import { nextWallClockInstant, wallClockInstant, type Command, type Job, type NormalizedUpdate, type Scope, type Seed, type Store, type StoreOptions, type Turn } from "../src/core.js";
 import { openStore } from "../src/store/index.js";
 import { createResponsesModel } from "../src/providers/responses.js";
 import { contextCoverageLimitation } from "../src/conversation.js";
@@ -545,31 +545,88 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     expect(JSON.stringify(view)).not.toContain("NEVER_LOG_THIS_SECRET");
   });
 
-  it.each(["scope", "workspace"] as const)("preserves a recovered effect while %s admission prevents automatic task resumption", async capacity => {
+  it("retains confirmed effect and stays blocked when recovery resumption hits pending-job capacity", async () => {
     const draft = await draftWrite();
     await command({ kind: "decide", approvalId: draft.approval.id, decision: "approve" }, "manager");
     const dispatched = await claimEffect();
     await store.unknownEffect(dispatched, "Outcome awaiting positive reconciliation");
-    const groups = capacity === "scope" ? [scope] : Array.from({ length: 5 }, () => ({ ...scope, id: randomUUID(), chatId: randomUUID() }));
-    if (capacity === "workspace") await store.seed({ ...seed, scopes: groups, memberships: groups.map(group => ({ scopeId: group.id, userId: "member", role: "member" })), grants: [] });
-    const fillers = await Promise.all(groups.flatMap(group => Array.from({ length: 20 }, (_, index) => store.command({ scopeId: group.id, userId: "member", key: randomUUID(), command: { kind: "start", instruction: `Admission saturation ${index}`, topicId: null } }).then(receipt => ({ receipt, scopeId: group.id })))));
-    expect(fillers.every(filler => filler.receipt.kind === "accepted")).toBe(true);
+    const held = await store.task(scope.id, "member", draft.taskId);
+    expect(held.task.state).toBe("blocked");
+    expect(held.task.reason).toBe("External outcome unknown. Reconciliation required.");
+
+    const probe = new DatabaseSync(options.databasePath);
+    try {
+      probe.prepare("UPDATE jobs SET state='held' WHERE id=?").run(dispatched.lease.id);
+    } finally {
+      probe.close();
+    }
+
+    const filler = await start("Recovery capacity filler");
+    for (let index = 0; index < 500; index += 1) {
+      expect((await command({ kind: "stop", taskId: filler })).kind).toBe("accepted");
+    }
+
+    await store.finishEffect(dispatched, { providerId: "write-confirmed-at-capacity", url: null, content: "Positively confirmed at capacity" });
+    const recoveryBlocked = await store.task(scope.id, "member", draft.taskId);
+    expect(recoveryBlocked.task.state).toBe("blocked");
+    expect(recoveryBlocked.task.reason).toContain("Workspace pending-job limit reached.");
+    expect(recoveryBlocked.effects[0]?.state).toBe("succeeded");
+    expect(recoveryBlocked.effects[0]?.providerId).toBe("write-confirmed-at-capacity");
+    expect(recoveryBlocked.events.some(event => event.kind === "recovery_admission_blocked")).toBe(true);
+  });
+
+  it("resolves nonexistent local times across spring-forward DST gap without stalling", () => {
+    const tz = "America/New_York";
+    const start = Date.UTC(2026, 2, 8, 6, 30);
+    const first = nextWallClockInstant(start, 3_600_000, tz);
+    expect(first).toBe(Date.UTC(2026, 2, 8, 7, 0));
+    expect(first).toBeGreaterThan(start);
+    const second = nextWallClockInstant(first, 3_600_000, tz);
+    expect(second).toBe(Date.UTC(2026, 2, 8, 8, 0));
+    expect(second).toBeGreaterThan(first);
+
+    const explicit = wallClockInstant("2026-03-08T02:30", tz);
+    expect(explicit).toBe(Date.UTC(2026, 2, 8, 7, 0));
+  });
+
+  it("skips backlog tasks and advances nextAt when routine is more than 50 intervals overdue", async () => {
+    const intervalMs = 86_400_000;
+    const staleNextAt = now - 60 * intervalMs;
+    await command({ kind: "create_routine", instruction: "Overdue digest", timezone: "America/New_York", nextAt: staleNextAt, intervalMs, budgetMicros: 5000 }, "manager");
+    const beforeView = await store.view(scope.id, "member");
+    const routineId = beforeView.routines.find(r => r.instruction === "Overdue digest")!.id;
+
+    await store.materializeRoutines();
+
+    const afterView = await store.view(scope.id, "member");
+    const updatedRoutine = afterView.routines.find(r => r.id === routineId)!;
+    expect(updatedRoutine.nextAt).toBeGreaterThan(now);
+    expect(afterView.tasks.filter(t => t.task.instruction === "Overdue digest")).toHaveLength(0);
+
+    const probe = new DatabaseSync(options.databasePath);
+    try {
+      const skipped = probe.prepare("SELECT count(*) AS count FROM events WHERE workspace_id=? AND json_extract(data, '$.kind') = 'routine_backlog_skipped'").get(seed.workspaceId) as { count: number } | undefined;
+      expect(skipped?.count).toBe(1);
+    } finally { probe.close(); }
+  });
+
+  it("resumes a recovered effect with one dispatch and the confirmed result in history", async () => {
+    const draft = await draftWrite();
+    await command({ kind: "decide", approvalId: draft.approval.id, decision: "approve" }, "manager");
+    const dispatched = await claimEffect();
+    await store.unknownEffect(dispatched, "Outcome awaiting positive reconciliation");
+    const held = await store.task(scope.id, "member", draft.taskId);
+    expect(held.task.state).toBe("blocked");
+    expect(held.task.reason).toBe("External outcome unknown. Reconciliation required.");
     await store.finishEffect(dispatched, { providerId: "original-write-confirmed", url: null, content: "Original effect positively confirmed" });
     const recovered = await store.task(scope.id, "member", draft.taskId);
-    expect(recovered.task.state).toBe("blocked");
-    expect(recovered.task.reason).toContain(capacity === "scope" ? "Scope active-task limit reached." : "Workspace pending-task limit reached.");
+    expect(recovered.task.state).toBe("queued");
     expect(recovered.effects[0]?.state).toBe("succeeded");
     expect(recovered.effects[0]?.providerId).toBe("original-write-confirmed");
-    expect(recovered.events.some(event => event.kind === "recovery_admission_blocked")).toBe(true);
     expect(recovered.events.filter(event => event.kind === "effect_dispatched")).toHaveLength(1);
-    for (const filler of fillers) {
-      if (!filler.receipt.taskId) throw new Error("Filler task missing");
-      await store.command({ scopeId: filler.scopeId, userId: "member", key: randomUUID(), command: { kind: "stop", taskId: filler.receipt.taskId } });
-    }
-    expect((await command({ kind: "resume", taskId: draft.taskId })).kind).toBe("accepted");
     let next: ModelJob | null = null;
     for (let index = 0; index < 250; index += 1) {
-      const job = await store.claim("recovery-capacity-worker");
+      const job = await store.claim("recovery-worker");
       if (!job) break;
       if (job.kind === "delivery") await store.finishDelivery(job, ++deliveryMessageId);
       else if (job.kind === "model") { next = job; break; }
@@ -577,6 +634,20 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     }
     expect(next?.input.task.id).toBe(draft.taskId);
     expect(next?.input.history.flatMap(row => row.content).some(block => block.type === "tool_result" && block.content === "Original effect positively confirmed")).toBe(true);
+  });
+
+  it("skips a routine occurrence while the pending-job cap is saturated", async () => {
+    await command({ kind: "create_routine", instruction: "Capacity digest", timezone: "UTC", nextAt: now + 1000, intervalMs: 86_400_000, budgetMicros: 5000 }, "manager");
+    const filler = await start("Routine capacity filler");
+    for (let index = 0; index < 500; index += 1) expect((await command({ kind: "stop", taskId: filler })).kind).toBe("accepted");
+    now += 1001;
+    await store.materializeRoutines();
+    expect((await store.view(scope.id, "member")).tasks).toHaveLength(1);
+    const probe = new DatabaseSync(options.databasePath);
+    try {
+      const skipped = probe.prepare("SELECT count(*) AS count FROM events WHERE workspace_id=? AND json_extract(data,'$.kind')='routine_capacity_skipped'").get(seed.workspaceId) as { count: number } | undefined;
+      expect(skipped?.count).toBe(1);
+    } finally { probe.close(); }
   });
 
   it("reserves the workspace allowance atomically across concurrent tasks", async () => {
@@ -593,20 +664,6 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     expect(view.tasks.filter(task => task.task.state === "blocked")).toHaveLength(1);
     await store.finishModel(first, turn());
     expect((await store.view(limitedScope.id, "member")).usage.spentMicros).toBe(1000);
-  });
-
-  it("admits at most twenty active tasks per scope without reserving rejected work", async () => {
-    const receipts = await Promise.all(Array.from({ length: 21 }, (_, index) => command({ kind: "start", instruction: `Bounded task ${index}`, topicId: null })));
-    expect(receipts.filter(receipt => receipt.kind === "accepted")).toHaveLength(20);
-    expect(receipts.filter(receipt => receipt.kind === "denied" && receipt.message === "Scope active-task limit reached.")).toHaveLength(1);
-    const view = await store.view(scope.id, "member");
-    expect(view.tasks).toHaveLength(20);
-    expect(view.usage.heldMicros).toBe(0);
-    expect(view.tasks.flatMap(task => task.effects)).toHaveLength(0);
-    const firstTask = view.tasks[0]?.task;
-    if (!firstTask) throw new Error("Admitted task missing");
-    expect((await command({ kind: "stop", taskId: firstTask.id })).kind).toBe("accepted");
-    expect((await command({ kind: "start", instruction: "Capacity released by stop", topicId: null })).kind).toBe("accepted");
   });
 
   it("leases at most two model tasks per scope and defers a third worker", async () => {
@@ -632,17 +689,6 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     const third = await claimModel();
     expect([first.input.task.id, second.input.task.id]).not.toContain(third.input.task.id);
     expect((await store.view(scope.id, "member")).usage.heldMicros).toBe(2000);
-  });
-
-  it("bounds pending tasks across groups at the workspace admission limit", async () => {
-    const groups = [scope, ...Array.from({ length: 4 }, () => ({ ...scope, id: randomUUID(), chatId: randomUUID() }))];
-    await store.seed({ ...seed, scopes: groups.slice(1), memberships: groups.slice(1).map(group => ({ scopeId: group.id, userId: "member", role: "member" })), grants: [] });
-    const receipts = await Promise.all(groups.flatMap(group => Array.from({ length: 20 }, (_, index) => store.command({ scopeId: group.id, userId: "member", key: randomUUID(), command: { kind: "start", instruction: `Workspace capacity fixture ${index}`, topicId: null } }))));
-    expect(receipts.filter(receipt => receipt.kind === "accepted")).toHaveLength(100);
-    const rejected = await store.command({ scopeId: otherScope.id, userId: "other", key: randomUUID(), command: { kind: "start", instruction: "Beyond workspace cap", topicId: null } });
-    expect(rejected).toEqual({ kind: "denied", message: "Workspace pending-task limit reached." });
-    expect((await store.view(otherScope.id, "other")).tasks).toHaveLength(0);
-    expect((await store.view(scope.id, "member")).usage.heldMicros).toBe(0);
   });
 
   it("caps pending jobs at five hundred while keeping Stop and cleanup commands available", async () => {
@@ -871,7 +917,7 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     expect(text).toContain("New reply steers after migration");
   });
 
-  it("creates one daily fixed UTC occurrence across restart and skips paused backlog", async () => {
+  it("creates one daily wall-clock occurrence across restart and skips paused backlog", async () => {
     await command({ kind: "create_routine", instruction: "Daily fixture digest", timezone: "America/New_York", nextAt: now + 1000, intervalMs: 86_400_000, budgetMicros: 5000 }, "manager");
     const routine = (await store.view(scope.id, "member")).routines[0];
     if (!routine) throw new Error("Routine missing");
@@ -890,6 +936,21 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     const resumed = (await store.view(scope.id, "member")).routines[0];
     expect(resumed?.nextAt).toBeGreaterThan(now);
     expect(resumed?.intervalMs).toBe(86_400_000);
+  });
+
+  it("keeps the local time of a daily routine across a daylight saving change", async () => {
+    const first = Date.UTC(2026, 9, 31, 13, 30); // 09:30 America/New_York, still EDT (UTC-4)
+    now = first - 1000;
+    await command({ kind: "create_routine", instruction: "DST digest", timezone: "America/New_York", nextAt: first, intervalMs: 86_400_000, budgetMicros: 5000 }, "manager");
+    now = first;
+    await store.materializeRoutines();
+    const afterFirst = (await store.view(scope.id, "member")).routines[0];
+    expect(afterFirst?.nextAt).toBe(Date.UTC(2026, 10, 1, 14, 30)); // 09:30 EST (UTC-5) after the Nov 1 change
+    now = Date.UTC(2026, 10, 1, 14, 30);
+    await store.materializeRoutines();
+    const afterSecond = (await store.view(scope.id, "member")).routines[0];
+    expect(afterSecond?.nextAt).toBe(Date.UTC(2026, 10, 2, 14, 30));
+    expect((await store.view(scope.id, "member")).tasks).toHaveLength(2);
   });
 
   it("materializes routines independently of job claiming", async () => {

@@ -2,6 +2,18 @@
 
 This proposed reference defines user-visible behavior. It implements C01 through C15 of the [product specification](product-spec.md). Its parity register records fresh official Claude Tag evidence. Platform behavior remains untested here. A live test bot must verify the client and Bot API assumptions at gate P.
 
+## Current pilot conversation presentation
+
+The selected option B acknowledges requests briefly, then sends a separate answer. A simple greeting has no visible task UUID, accepted/completed banner, Stop, or Configure button. Work still active after eight seconds gets one durable progress message with Stop. Tool turns can update its stage. Completed, stopped, or blocked work clears active controls; results remain separate messages.
+
+Use `/settings` or `/configure` to open the authorized Mini App settings. Routine context-coverage metadata stays in the inspector. Answers still disclose relevant missing evidence, incomplete output, unsupported access, and uncertain external outcomes. This presentation does not change task isolation, membership checks, budget reservations, or exact action review. See [the selected behavior plan](coworker-behavior-plan.md).
+
+Final model answers use Telegram's native Rich Messages API with GFM Markdown for headings, tables, lists, quotes, and code. Acknowledgements, progress, settings, and exact write approval previews remain plain messages. Stored answers retain their original text. Both model providers receive the same formatting guidance.
+
+Outgoing rich answers have a conservative limit of 32,768 Unicode characters in their source text. Longer answers show a literal truncated excerpt and an inspector link when a Mini App link is configured. Answers containing `<` or `![` use literal rich paragraphs to prevent embedded HTML actions or media. This guard also applies inside code examples. Confirmed Markdown parsing or formatting-limit rejections retry once as literal rich paragraphs. Other API errors follow the existing delivery retry path.
+
+This outgoing support uses the installed grammY API and requires no dependency update. Incoming `rich_message` content is not yet normalized. Automated tests verify payloads and delivery behavior; live Telegram rendering remains unverified. See [Telegram's Rich Message formatting reference](https://core.telegram.org/bots/api#rich-message-formatting-options).
+
 ## Setup and collection
 
 1. An owner starts the bot in a DM and creates a workspace.
