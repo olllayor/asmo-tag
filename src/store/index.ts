@@ -5,7 +5,7 @@ import { z } from "zod";
 import { conversationAnswer } from "../conversation.js";
 import {
   approvalSchema, commandSchema, effectSchema, eventSchema, grantSchema, memorySchema,
-  routineSchema, scopeSchema, sourceSchema, taskSchema, taskViewSchema, transcriptSchema,
+  nextWallClockInstant, routineSchema, scopeSchema, sourceSchema, taskSchema, taskViewSchema, transcriptSchema,
   turnSchema, toolCallSchema, workspaceViewSchema,
 } from "../core.js";
 import type {
@@ -16,6 +16,19 @@ import type {
 
 
 type Table = "scopes" | "tasks" | "sources" | "effects" | "approvals" | "events" | "memories" | "routines" | "grants";
+
+// Last scheduled occurrence at or before now, walked in wall-clock steps so daylight saving
+// keeps the local time. The walk is capped so a routine paused for a long stretch resumes at
+// its next run instead of replaying every missed occurrence in one pass.
+function lastWallClockOccurrence(routine: Routine, now: number): number {
+  let occurrence = routine.nextAt;
+  let next = nextWallClockInstant(occurrence, routine.intervalMs, routine.timezone);
+  for (let walked = 0; next <= now && walked < 50; walked += 1) {
+    occurrence = next;
+    next = nextWallClockInstant(occurrence, routine.intervalMs, routine.timezone);
+  }
+  return occurrence;
+}
 function grantForCall(grants: Grant[], call: ToolCall): Grant | undefined {
   if (call.name === "notion_search" || call.name === "notion_read_page") return grants.find(grant => grant.active && grant.kind === "notion_scope" && grant.read);
   return grants.find(grant => grant.active && grant.kind !== "notion_scope" && grant.repository === call.input.repository && (call.name === "github_read_issues" ? grant.read : grant.write));
@@ -401,16 +414,16 @@ class SQLiteStore implements Store {
     }
     if (command.kind === "create_routine") {
       try { new Intl.DateTimeFormat("en", { timeZone: command.timezone }).format(); } catch { return denied("Invalid timezone."); }
-      if (command.intervalMs !== 86_400_000) return denied("The pilot supports daily fixed UTC routines.");
       const routine: Routine = { id: uuid(), scopeId: scope.id, createdBy: userId, instruction: command.instruction, state: "active", timezone: command.timezone, nextAt: command.nextAt, intervalMs: command.intervalMs, budgetMicros: command.budgetMicros };
       await db.query("INSERT INTO routines(workspace_id,scope_id,id,data) VALUES($1,$2,$3,$4)", [scope.workspaceId, scope.id, routine.id, JSON.stringify(routine)]);
-      await event(db, scope, null, userId, "routine_created", { routineId: routine.id, timezone: routine.timezone, utcOccurrence: routine.nextAt, basis: "fixed_utc" }, this.now());
-      return { kind: "accepted", message: "Daily fixed UTC schedule saved. Daylight saving changes shift its local time." };
+      await event(db, scope, null, userId, "routine_created", { routineId: routine.id, timezone: routine.timezone, utcOccurrence: routine.nextAt, intervalMs: routine.intervalMs, basis: "wall_clock" }, this.now());
+      return { kind: "accepted", message: `Wall-clock schedule saved in ${routine.timezone}. Runs at the same local time each interval.` };
     }
     if (command.kind === "set_routine") {
       const routine = (await records(db, "routines", routineSchema, "scope_id=$1 AND id=$2", [scope.id, command.routineId]))[0];
       if (!routine || routine.state === "revoked") return denied();
-      const nextAt = command.state === "active" && routine.nextAt <= this.now() ? routine.nextAt + (Math.floor((this.now() - routine.nextAt) / routine.intervalMs) + 1) * routine.intervalMs : routine.nextAt;
+      const occurrence = lastWallClockOccurrence(routine, this.now());
+      const nextAt = command.state === "active" && routine.nextAt <= this.now() ? nextWallClockInstant(occurrence, routine.intervalMs, routine.timezone) : routine.nextAt;
       await save(db, "routines", { ...routine, state: command.state, nextAt });
       await event(db, scope, null, userId, "routine_changed", { routineId: routine.id, state: command.state }, this.now());
       return { kind: "accepted" };
@@ -653,7 +666,7 @@ class SQLiteStore implements Store {
         const routine = (await records(db, "routines", routineSchema, "id=$1", [location.id]))[0];
         if (!routine || routine.state !== "active" || routine.nextAt > this.now()) return;
         if (!scope.active) { await save(db, "routines", { ...routine, state: "paused" }); return; }
-        const occurrence = routine.nextAt + Math.floor((this.now() - routine.nextAt) / routine.intervalMs) * routine.intervalMs;
+        const occurrence = lastWallClockOccurrence(routine, this.now());
         const existing = await rows(db, "SELECT task_id FROM occurrences WHERE workspace_id=$workspace AND routine_id=$1 AND at=$2", [routine.id, occurrence], z.object({ task_id: z.string() }));
         if (!existing.length) {
           const admission = await this.admissionReason(db, scope, null, 2);
@@ -661,10 +674,10 @@ class SQLiteStore implements Store {
           else {
             const task = await this.createTask(db, scope, `routine:${routine.id}`, routine.instruction, null, routine.budgetMicros);
             await db.query("INSERT INTO occurrences(workspace_id,scope_id,routine_id,at,task_id) VALUES($1,$2,$3,$4,$5)", [scope.workspaceId, scope.id, routine.id, occurrence, task.id]);
-            await event(db, scope, task.id, null, "routine_occurrence", { routineId: routine.id, occurrence, basis: "fixed_utc" }, this.now());
+            await event(db, scope, task.id, null, "routine_occurrence", { routineId: routine.id, occurrence, basis: "wall_clock" }, this.now());
           }
         }
-        await save(db, "routines", { ...routine, nextAt: occurrence + routine.intervalMs });
+        await save(db, "routines", { ...routine, nextAt: nextWallClockInstant(occurrence, routine.intervalMs, routine.timezone) });
       });
     }
   }

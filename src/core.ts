@@ -391,3 +391,45 @@ export type StoreOptions = {
   simulated: boolean;
   clock?: () => number;
 };
+
+// Routine scheduling runs on wall-clock intent. A routine stores an IANA timezone and a
+// first occurrence, and every later occurrence is derived by shifting that wall clock, so
+// daylight saving moves the instant and the local time stays put. On a spring-forward gap
+// the nearest valid instant is used.
+const wallClockFormatters = new Map<string, Intl.DateTimeFormat>();
+
+function wallClockFormatter(timeZone: string): Intl.DateTimeFormat {
+  const cached = wallClockFormatters.get(timeZone);
+  if (cached) return cached;
+  const created = new Intl.DateTimeFormat("en-US", { timeZone, hourCycle: "h23", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  wallClockFormatters.set(timeZone, created);
+  return created;
+}
+
+function wallClockOffsetMs(instant: number, timeZone: string): number {
+  const parts = wallClockFormatter(timeZone).formatToParts(new Date(instant));
+  const read = (type: Intl.DateTimeFormatPartTypes): number => {
+    const value = parts.find(part => part.type === type)?.value;
+    if (value === undefined) throw new Error(`Wall-clock part ${type} unavailable for ${timeZone}.`);
+    return Number(value);
+  };
+  const wallAsUtc = Date.UTC(read("year"), read("month") - 1, read("day"), read("hour"), read("minute"), read("second"));
+  return wallAsUtc - Math.floor(instant / 1000) * 1000;
+}
+
+/** Instant of the next wall-clock occurrence, derived in timeZone rather than in UTC. */
+export function nextWallClockInstant(from: number, intervalMs: number, timeZone: string): number {
+  const shifted = new Date(from + wallClockOffsetMs(from, timeZone) + intervalMs);
+  const wallAsUtc = Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth(), shifted.getUTCDate(), shifted.getUTCHours(), shifted.getUTCMinutes(), shifted.getUTCSeconds(), shifted.getUTCMilliseconds());
+  const firstPass = wallAsUtc - wallClockOffsetMs(wallAsUtc, timeZone);
+  return wallAsUtc - wallClockOffsetMs(firstPass, timeZone);
+}
+
+/** Instant for a datetime-local value ("YYYY-MM-DDTHH:mm") read as wall-clock time in timeZone. */
+export function wallClockInstant(value: string, timeZone: string): number {
+  const parsed = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(value);
+  if (!parsed) throw new Error("Choose a valid local date and time.");
+  const wallAsUtc = Date.UTC(Number(parsed[1]), Number(parsed[2]) - 1, Number(parsed[3]), Number(parsed[4]), Number(parsed[5]));
+  const firstPass = wallAsUtc - wallClockOffsetMs(wallAsUtc, timeZone);
+  return wallAsUtc - wallClockOffsetMs(firstPass, timeZone);
+}

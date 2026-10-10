@@ -871,7 +871,7 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     expect(text).toContain("New reply steers after migration");
   });
 
-  it("creates one daily fixed UTC occurrence across restart and skips paused backlog", async () => {
+  it("creates one daily wall-clock occurrence across restart and skips paused backlog", async () => {
     await command({ kind: "create_routine", instruction: "Daily fixture digest", timezone: "America/New_York", nextAt: now + 1000, intervalMs: 86_400_000, budgetMicros: 5000 }, "manager");
     const routine = (await store.view(scope.id, "member")).routines[0];
     if (!routine) throw new Error("Routine missing");
@@ -890,6 +890,21 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     const resumed = (await store.view(scope.id, "member")).routines[0];
     expect(resumed?.nextAt).toBeGreaterThan(now);
     expect(resumed?.intervalMs).toBe(86_400_000);
+  });
+
+  it("keeps the local time of a daily routine across a daylight saving change", async () => {
+    const first = Date.UTC(2026, 9, 31, 13, 30); // 09:30 America/New_York, still EDT (UTC-4)
+    now = first - 1000;
+    await command({ kind: "create_routine", instruction: "DST digest", timezone: "America/New_York", nextAt: first, intervalMs: 86_400_000, budgetMicros: 5000 }, "manager");
+    now = first;
+    await store.materializeRoutines();
+    const afterFirst = (await store.view(scope.id, "member")).routines[0];
+    expect(afterFirst?.nextAt).toBe(Date.UTC(2026, 10, 1, 14, 30)); // 09:30 EST (UTC-5) after the Nov 1 change
+    now = Date.UTC(2026, 10, 1, 14, 30);
+    await store.materializeRoutines();
+    const afterSecond = (await store.view(scope.id, "member")).routines[0];
+    expect(afterSecond?.nextAt).toBe(Date.UTC(2026, 10, 2, 14, 30));
+    expect((await store.view(scope.id, "member")).tasks).toHaveLength(2);
   });
 
   it("materializes routines independently of job claiming", async () => {
