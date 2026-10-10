@@ -16,6 +16,8 @@ import type {
 
 
 type Table = "scopes" | "tasks" | "sources" | "effects" | "approvals" | "events" | "memories" | "routines" | "grants";
+type CommandContext = { db: Db; scope: Scope; userId: string; role: string; denied: (message?: string) => Receipt };
+const inactiveScopeCommands = new Set<Command["kind"]>(["set_scope", "stop", "cancel", "forget_sources", "correct_memory", "set_memory"]);
 
 // Last scheduled occurrence at or before now, walked in wall-clock steps so daylight saving
 // keeps the local time. The walk is capped so a routine paused for a long stretch resumes at
@@ -320,131 +322,167 @@ class SQLiteStore implements Store {
   }
   async applyCommand(db: Db, scope: Scope, userId: string, role: string, command: Command): Promise<Receipt> {
     const denied = (message = "Action denied."): Receipt => ({ kind: "denied", message });
-    if (!scope.active && !["set_scope", "stop", "cancel", "forget_sources", "correct_memory", "set_memory"].includes(command.kind)) return denied("Scope inactive.");
-    if (command.kind === "start") { const reason = await this.admissionReason(db, 3); if (reason) return denied(reason); const task = await this.createTask(db, scope, userId, command.instruction, command.topicId); return { kind: "accepted", taskId: task.id }; }
-    if (["steer", "stop", "resume", "cancel"].includes(command.kind) && "taskId" in command) {
-      const task = (await records(db, "tasks", taskSchema, "scope_id=$1 AND id=$2", [scope.id, command.taskId]))[0];
-      if (!task) return denied();
-      if (task.state === "canceled") return denied("Task canceled. Start a new task.");
-      if (command.kind === "steer") {
-        if (!liveStates.has(task.state)) { const reason = await this.admissionReason(db, 1); if (reason) return denied(reason); }
-        const updated: Task = { ...task, epoch: task.epoch + 1, revision: task.revision + 1, state: "queued", reason: null };
-        await save(db, "tasks", updated);
-        await this.invalidateEffects(db, scope, updated, "Action invalidated by steering.");
-        await this.note(db, scope, updated, `Instruction from ${userId}: ${command.text}`);
-        await db.query("UPDATE jobs SET state='held' WHERE workspace_id=$workspace AND kind='model' AND entity_id=$1", [task.id]);
-        await queue(db, scope, task.id, "model", task.id, {}, this.now());
-        await event(db, scope, task.id, userId, "steering_recorded", { text: command.text, revision: updated.revision }, this.now());
-        await notice(db, scope, updated, "Got it.", this.now(), [], "acknowledgement");
-        await progress(db, scope, updated, "I'm working through your update.", this.now(), 8000);
-      } else if (command.kind === "stop" || command.kind === "cancel") {
-        const inflight = (await records(db, "effects", effectSchema, "task_id=$1 AND data->>'state' IN ('dispatching','unknown')", [task.id])).length;
-        const running = await rows(db, "SELECT id FROM jobs WHERE workspace_id=$workspace AND task_id=$1 AND kind='model' AND state='leased' AND expires_at>$2", [task.id, this.now()], z.object({ id: z.string() }));
-        const updated: Task = { ...task, epoch: task.epoch + 1, revision: task.revision + 1, state: command.kind === "cancel" ? "canceled" : inflight || running.length ? "stopping" : "paused", reason: inflight ? "An external effect is still in flight or unknown." : null };
-        await save(db, "tasks", updated);
-        await this.invalidateEffects(db, scope, updated, "Dispatch stopped.");
-        await db.query("UPDATE jobs SET state='held' WHERE workspace_id=$workspace AND task_id=$1 AND kind='model' AND state='ready'", [task.id]);
-        await event(db, scope, task.id, userId, command.kind === "stop" ? "stop_requested" : "task_canceled", { inFlightEffects: inflight }, this.now());
-        await notice(db, scope, updated, `${updated.state === "stopping" ? "I’m stopping." : updated.state === "canceled" ? "I’ve canceled this work." : "I’ve stopped."}${inflight ? " An external action is still pending. I’ll confirm its outcome before any retry." : " Completed actions are retained."}`, this.now());
-        await progress(db, scope, updated, settledProgress(updated), this.now());
-      } else {
-        if (!["paused", "stopping", "blocked", "failed", "waiting_for_input"].includes(task.state)) return denied("Task is not resumable.");
-        const admission = await this.admissionReason(db, 1);
-        if (admission) return denied(admission);
-        const updated: Task = { ...task, epoch: task.epoch + 1, revision: task.revision + 1, state: "queued", reason: null };
-        await save(db, "tasks", updated);
-        await this.invalidateEffects(db, scope, updated, "Resume requires a fresh action review.");
-        for (const effect of await records(db, "effects", effectSchema, "task_id=$1 AND data->>'state'='unknown'", [task.id])) await queue(db, scope, task.id, "effect", effect.id, {}, this.now());
-        await db.query("UPDATE jobs SET state='held' WHERE workspace_id=$workspace AND kind='model' AND entity_id=$1", [task.id]);
-        await queue(db, scope, task.id, "model", task.id, {}, this.now());
-        await event(db, scope, task.id, userId, "task_resumed", { revision: updated.revision }, this.now());
-        await notice(db, scope, updated, "I'll pick this back up.", this.now(), [], "acknowledgement");
-        await progress(db, scope, updated, "I'm continuing the work.", this.now(), 8000);
-      }
-      return { kind: "accepted", taskId: task.id };
+    if (!scope.active && !inactiveScopeCommands.has(command.kind)) return denied("Scope inactive.");
+    const context: CommandContext = { db, scope, userId, role, denied };
+    switch (command.kind) {
+      case "start": return this.commandStart(command, context);
+      case "steer":
+      case "stop":
+      case "resume":
+      case "cancel": return this.commandTaskControl(command, context);
+      case "decide": return this.commandDecide(command, context);
+      case "remember": return this.commandRemember(command, context);
+      case "correct_memory":
+      case "set_memory": return this.commandEditMemory(command, context);
+      case "forget_sources": return this.commandForgetSources(command, context);
+      case "create_routine": return this.commandCreateRoutine(command, context);
+      case "set_routine": return this.commandSetRoutine(command, context);
+      case "revoke_grant": return this.commandRevokeGrant(command, context);
+      case "set_scope": return this.commandSetScope(command, context);
+      default: { const unhandled: never = command; throw new Error(`Unhandled command ${JSON.stringify(unhandled)}`); }
     }
-    if (command.kind === "decide") {
-      if (!manager(role)) return denied("A current manager must approve this action.");
-      const approval = (await records(db, "approvals", approvalSchema, "scope_id=$1 AND id=$2", [scope.id, command.approvalId]))[0];
-      if (!approval) return denied();
-      if (approval.state === "approved" || approval.state === "denied") return { kind: "duplicate", taskId: approval.taskId };
-      if (approval.state !== "pending") return denied("Approval is no longer valid.");
-      const task = await taskRecord(db, scope.id, approval.taskId);
-      const effect = first(await records(db, "effects", effectSchema, "id=$1", [approval.effectId]));
-      const valid = approval.expiresAt > this.now() && approval.hash === effect.hash && digest(effect.call) === effect.hash && await this.effectAllowed(db, scope, task, effect);
-      if (!valid) { await save(db, "approvals", { ...approval, state: approval.expiresAt <= this.now() ? "expired" : "invalidated" }); await save(db, "effects", { ...effect, state: "denied", result: "Approval expired or invalidated.", reason: "Approval expired or invalidated." }); await this.advance(db, scope, task); return denied("Approval expired or invalidated."); }
-      await save(db, "approvals", { ...approval, state: command.decision === "approve" ? "approved" : "denied", decidedBy: userId });
-      await save(db, "effects", { ...effect, state: command.decision === "approve" ? "ready" : "denied", result: command.decision === "deny" ? "Manager denied this action." : null });
-      await event(db, scope, task.id, userId, "approval_decided", { approvalId: approval.id, effectId: effect.id, hash: effect.hash, decision: command.decision, taskRevision: effect.taskRevision, policyRevision: effect.policyRevision, grantRevision: effect.grantRevision }, this.now());
-      if (command.decision === "approve") await queue(db, scope, task.id, "effect", effect.id, {}, this.now());
-      else await this.advance(db, scope, task);
-      return { kind: "accepted", taskId: task.id };
+  }
+  private async commandStart(command: Extract<Command, { kind: "start" }>, context: CommandContext): Promise<Receipt> {
+    const { db, scope, userId, denied } = context;
+    const reason = await this.admissionReason(db, 3);
+    if (reason) return denied(reason);
+    const task = await this.createTask(db, scope, userId, command.instruction, command.topicId);
+    return { kind: "accepted", taskId: task.id };
+  }
+  private async commandTaskControl(command: Extract<Command, { kind: "steer" | "stop" | "resume" | "cancel" }>, context: CommandContext): Promise<Receipt> {
+    const { db, scope, userId, denied } = context;
+    const task = (await records(db, "tasks", taskSchema, "scope_id=$1 AND id=$2", [scope.id, command.taskId]))[0];
+    if (!task) return denied();
+    if (task.state === "canceled") return denied("Task canceled. Start a new task.");
+    if (command.kind === "steer") {
+      if (!liveStates.has(task.state)) { const reason = await this.admissionReason(db, 1); if (reason) return denied(reason); }
+      const updated: Task = { ...task, epoch: task.epoch + 1, revision: task.revision + 1, state: "queued", reason: null };
+      await save(db, "tasks", updated);
+      await this.invalidateEffects(db, scope, updated, "Action invalidated by steering.");
+      await this.note(db, scope, updated, `Instruction from ${userId}: ${command.text}`);
+      await db.query("UPDATE jobs SET state='held' WHERE workspace_id=$workspace AND kind='model' AND entity_id=$1", [task.id]);
+      await queue(db, scope, task.id, "model", task.id, {}, this.now());
+      await event(db, scope, task.id, userId, "steering_recorded", { text: command.text, revision: updated.revision }, this.now());
+      await notice(db, scope, updated, "Got it.", this.now(), [], "acknowledgement");
+      await progress(db, scope, updated, "I'm working through your update.", this.now(), 8000);
+    } else if (command.kind === "stop" || command.kind === "cancel") {
+      const inflight = (await records(db, "effects", effectSchema, "task_id=$1 AND data->>'state' IN ('dispatching','unknown')", [task.id])).length;
+      const running = await rows(db, "SELECT id FROM jobs WHERE workspace_id=$workspace AND task_id=$1 AND kind='model' AND state='leased' AND expires_at>$2", [task.id, this.now()], z.object({ id: z.string() }));
+      const updated: Task = { ...task, epoch: task.epoch + 1, revision: task.revision + 1, state: command.kind === "cancel" ? "canceled" : inflight || running.length ? "stopping" : "paused", reason: inflight ? "An external effect is still in flight or unknown." : null };
+      await save(db, "tasks", updated);
+      await this.invalidateEffects(db, scope, updated, "Dispatch stopped.");
+      await db.query("UPDATE jobs SET state='held' WHERE workspace_id=$workspace AND task_id=$1 AND kind='model' AND state='ready'", [task.id]);
+      await event(db, scope, task.id, userId, command.kind === "stop" ? "stop_requested" : "task_canceled", { inFlightEffects: inflight }, this.now());
+      await notice(db, scope, updated, `${updated.state === "stopping" ? "I’m stopping." : updated.state === "canceled" ? "I’ve canceled this work." : "I’ve stopped."}${inflight ? " An external action is still pending. I’ll confirm its outcome before any retry." : " Completed actions are retained."}`, this.now());
+      await progress(db, scope, updated, settledProgress(updated), this.now());
+    } else {
+      if (!["paused", "stopping", "blocked", "failed", "waiting_for_input"].includes(task.state)) return denied("Task is not resumable.");
+      const admission = await this.admissionReason(db, 1);
+      if (admission) return denied(admission);
+      const updated: Task = { ...task, epoch: task.epoch + 1, revision: task.revision + 1, state: "queued", reason: null };
+      await save(db, "tasks", updated);
+      await this.invalidateEffects(db, scope, updated, "Resume requires a fresh action review.");
+      for (const effect of await records(db, "effects", effectSchema, "task_id=$1 AND data->>'state'='unknown'", [task.id])) await queue(db, scope, task.id, "effect", effect.id, {}, this.now());
+      await db.query("UPDATE jobs SET state='held' WHERE workspace_id=$workspace AND kind='model' AND entity_id=$1", [task.id]);
+      await queue(db, scope, task.id, "model", task.id, {}, this.now());
+      await event(db, scope, task.id, userId, "task_resumed", { revision: updated.revision }, this.now());
+      await notice(db, scope, updated, "I'll pick this back up.", this.now(), [], "acknowledgement");
+      await progress(db, scope, updated, "I'm continuing the work.", this.now(), 8000);
     }
-    if (command.kind === "remember") {
-      const evidence = await records(db, "sources", sourceSchema, "scope_id=$1 AND NOT deleted AND id IN (SELECT value FROM json_each($2))", [scope.id, command.evidenceIds]);
-      if (evidence.length !== new Set(command.evidenceIds).size) return denied("Evidence unavailable in this scope.");
-      const memory: Memory = { id: uuid(), scopeId: scope.id, content: command.content, evidenceIds: command.evidenceIds, revision: 1, state: command.candidate ? "candidate" : "active", authorId: userId, correctedByHuman: false };
-      await db.query("INSERT INTO memories(workspace_id,scope_id,id,data) VALUES($1,$2,$3,$4)", [scope.workspaceId, scope.id, memory.id, JSON.stringify(memory)]);
-      await event(db, scope, null, userId, "memory_saved", { memoryId: memory.id }, this.now());
-      return { kind: "accepted" };
+    return { kind: "accepted", taskId: task.id };
+  }
+  private async commandDecide(command: Extract<Command, { kind: "decide" }>, context: CommandContext): Promise<Receipt> {
+    const { db, scope, userId, denied } = context;
+    if (!manager(context.role)) return denied("A current manager must approve this action.");
+    const approval = (await records(db, "approvals", approvalSchema, "scope_id=$1 AND id=$2", [scope.id, command.approvalId]))[0];
+    if (!approval) return denied();
+    if (approval.state === "approved" || approval.state === "denied") return { kind: "duplicate", taskId: approval.taskId };
+    if (approval.state !== "pending") return denied("Approval is no longer valid.");
+    const task = await taskRecord(db, scope.id, approval.taskId);
+    const effect = first(await records(db, "effects", effectSchema, "id=$1", [approval.effectId]));
+    const valid = approval.expiresAt > this.now() && approval.hash === effect.hash && digest(effect.call) === effect.hash && await this.effectAllowed(db, scope, task, effect);
+    if (!valid) { await save(db, "approvals", { ...approval, state: approval.expiresAt <= this.now() ? "expired" : "invalidated" }); await save(db, "effects", { ...effect, state: "denied", result: "Approval expired or invalidated.", reason: "Approval expired or invalidated." }); await this.advance(db, scope, task); return denied("Approval expired or invalidated."); }
+    await save(db, "approvals", { ...approval, state: command.decision === "approve" ? "approved" : "denied", decidedBy: userId });
+    await save(db, "effects", { ...effect, state: command.decision === "approve" ? "ready" : "denied", result: command.decision === "deny" ? "Manager denied this action." : null });
+    await event(db, scope, task.id, userId, "approval_decided", { approvalId: approval.id, effectId: effect.id, hash: effect.hash, decision: command.decision, taskRevision: effect.taskRevision, policyRevision: effect.policyRevision, grantRevision: effect.grantRevision }, this.now());
+    if (command.decision === "approve") await queue(db, scope, task.id, "effect", effect.id, {}, this.now());
+    else await this.advance(db, scope, task);
+    return { kind: "accepted", taskId: task.id };
+  }
+  private async commandRemember(command: Extract<Command, { kind: "remember" }>, context: CommandContext): Promise<Receipt> {
+    const { db, scope, userId, denied } = context;
+    const evidence = await records(db, "sources", sourceSchema, "scope_id=$1 AND NOT deleted AND id IN (SELECT value FROM json_each($2))", [scope.id, command.evidenceIds]);
+    if (evidence.length !== new Set(command.evidenceIds).size) return denied("Evidence unavailable in this scope.");
+    const memory: Memory = { id: uuid(), scopeId: scope.id, content: command.content, evidenceIds: command.evidenceIds, revision: 1, state: command.candidate ? "candidate" : "active", authorId: userId, correctedByHuman: false };
+    await db.query("INSERT INTO memories(workspace_id,scope_id,id,data) VALUES($1,$2,$3,$4)", [scope.workspaceId, scope.id, memory.id, JSON.stringify(memory)]);
+    await event(db, scope, null, userId, "memory_saved", { memoryId: memory.id }, this.now());
+    return { kind: "accepted" };
+  }
+  private async commandEditMemory(command: Extract<Command, { kind: "correct_memory" | "set_memory" }>, context: CommandContext): Promise<Receipt> {
+    const { db, scope, userId, denied } = context;
+    const memory = (await records(db, "memories", memorySchema, "scope_id=$1 AND id=$2", [scope.id, command.memoryId]))[0];
+    if (!memory) return denied();
+    if (command.kind === "correct_memory" && command.expectedRevision !== memory.revision) return denied("Memory changed. Reload before correcting.");
+    const updated: Memory = command.kind === "correct_memory" ? { ...memory, content: command.content, revision: memory.revision + 1, correctedByHuman: true, state: "active" } : { ...memory, state: command.state, revision: memory.revision + 1 };
+    await save(db, "memories", updated);
+    await this.invalidateContextDependencies(db, scope, { sourceIds: [], memoryIds: [memory.id] });
+    await event(db, scope, null, userId, "memory_changed", { memoryId: memory.id, revision: updated.revision }, this.now());
+    return { kind: "accepted" };
+  }
+  private async commandForgetSources(command: Extract<Command, { kind: "forget_sources" }>, context: CommandContext): Promise<Receipt> {
+    const { db, scope, userId, denied } = context;
+    if (!manager(context.role)) return denied("Manager authority required.");
+    const sources = await records(db, "sources", sourceSchema, "scope_id=$1 AND id IN (SELECT value FROM json_each($2)) AND NOT deleted", [scope.id, command.sourceIds]);
+    if (sources.length !== new Set(command.sourceIds).size) return denied("Source unavailable in this scope.");
+    for (const source of sources) { await save(db, "sources", { ...source, text: "[Source removed]", revision: source.revision + 1 }); await db.query("UPDATE sources SET deleted=true WHERE workspace_id=$workspace AND id=$1", [source.id]); }
+    await this.invalidateContextDependencies(db, scope, { sourceIds: command.sourceIds, memoryIds: [] });
+    await event(db, scope, null, userId, "sources_invalidated", { sourceIds: command.sourceIds }, this.now());
+    return { kind: "accepted", message: "Sources and dependent context invalidated. Exact unresolved-effect payloads remain restricted to recovery. External provider copies may remain." };
+  }
+  private async commandCreateRoutine(command: Extract<Command, { kind: "create_routine" }>, context: CommandContext): Promise<Receipt> {
+    const { db, scope, userId, denied } = context;
+    if (!manager(context.role)) return denied("Manager authority required.");
+    try { new Intl.DateTimeFormat("en", { timeZone: command.timezone }).format(); } catch { return denied("Invalid timezone."); }
+    const routine: Routine = { id: uuid(), scopeId: scope.id, createdBy: userId, instruction: command.instruction, state: "active", timezone: command.timezone, nextAt: command.nextAt, intervalMs: command.intervalMs, budgetMicros: command.budgetMicros };
+    await db.query("INSERT INTO routines(workspace_id,scope_id,id,data) VALUES($1,$2,$3,$4)", [scope.workspaceId, scope.id, routine.id, JSON.stringify(routine)]);
+    await event(db, scope, null, userId, "routine_created", { routineId: routine.id, timezone: routine.timezone, utcOccurrence: routine.nextAt, intervalMs: routine.intervalMs, basis: "wall_clock" }, this.now());
+    return { kind: "accepted", message: `Wall-clock schedule saved in ${routine.timezone}. Runs at the same local time each interval.` };
+  }
+  private async commandSetRoutine(command: Extract<Command, { kind: "set_routine" }>, context: CommandContext): Promise<Receipt> {
+    const { db, scope, userId, denied } = context;
+    if (!manager(context.role)) return denied("Manager authority required.");
+    const routine = (await records(db, "routines", routineSchema, "scope_id=$1 AND id=$2", [scope.id, command.routineId]))[0];
+    if (!routine || routine.state === "revoked") return denied();
+    const occurrence = lastWallClockOccurrence(routine, this.now());
+    const nextAt = command.state === "active" && routine.nextAt <= this.now() ? nextWallClockInstant(occurrence, routine.intervalMs, routine.timezone) : routine.nextAt;
+    await save(db, "routines", { ...routine, state: command.state, nextAt });
+    await event(db, scope, null, userId, "routine_changed", { routineId: routine.id, state: command.state }, this.now());
+    return { kind: "accepted" };
+  }
+  private async commandRevokeGrant(command: Extract<Command, { kind: "revoke_grant" }>, context: CommandContext): Promise<Receipt> {
+    const { db, scope, userId, denied } = context;
+    if (!manager(context.role)) return denied("Manager authority required.");
+    const grant = (await records(db, "grants", grantSchema, "scope_id=$1 AND id=$2", [scope.id, command.grantId]))[0];
+    if (!grant) return denied();
+    await save(db, "grants", { ...grant, active: false, revision: grant.revision + 1 });
+    await this.fenceScope(db, scope, "Connector grant revoked.");
+    await event(db, scope, null, userId, "grant_revoked", { grantId: grant.id }, this.now());
+    return { kind: "accepted" };
+  }
+  private async commandSetScope(command: Extract<Command, { kind: "set_scope" }>, context: CommandContext): Promise<Receipt> {
+    const { db, scope, userId, denied } = context;
+    if (!manager(context.role)) return denied("Manager authority required.");
+    if (command.workspacePublic !== undefined) {
+      const owner = first(await rows(db, "SELECT owner_id FROM workspaces WHERE id=$workspace AND id=$1", [scope.workspaceId], z.object({ owner_id: z.string() })));
+      if (owner.owner_id !== userId) return denied("Only the current workspace owner can change workspace sharing.");
     }
-    if (command.kind === "correct_memory" || command.kind === "set_memory") {
-      const memory = (await records(db, "memories", memorySchema, "scope_id=$1 AND id=$2", [scope.id, command.memoryId]))[0];
-      if (!memory) return denied();
-      if (command.kind === "correct_memory" && command.expectedRevision !== memory.revision) return denied("Memory changed. Reload before correcting.");
-      const updated: Memory = command.kind === "correct_memory" ? { ...memory, content: command.content, revision: memory.revision + 1, correctedByHuman: true, state: "active" } : { ...memory, state: command.state, revision: memory.revision + 1 };
-      await save(db, "memories", updated);
-      await this.invalidateContextDependencies(db, scope, { sourceIds: [], memoryIds: [memory.id] });
-      await event(db, scope, null, userId, "memory_changed", { memoryId: memory.id, revision: updated.revision }, this.now());
-      return { kind: "accepted" };
-    }
-    if (!manager(role)) return denied("Manager authority required.");
-    if (command.kind === "forget_sources") {
-      const sources = await records(db, "sources", sourceSchema, "scope_id=$1 AND id IN (SELECT value FROM json_each($2)) AND NOT deleted", [scope.id, command.sourceIds]);
-      if (sources.length !== new Set(command.sourceIds).size) return denied("Source unavailable in this scope.");
-      for (const source of sources) { await save(db, "sources", { ...source, text: "[Source removed]", revision: source.revision + 1 }); await db.query("UPDATE sources SET deleted=true WHERE workspace_id=$workspace AND id=$1", [source.id]); }
-      await this.invalidateContextDependencies(db, scope, { sourceIds: command.sourceIds, memoryIds: [] });
-      await event(db, scope, null, userId, "sources_invalidated", { sourceIds: command.sourceIds }, this.now());
-      return { kind: "accepted", message: "Sources and dependent context invalidated. Exact unresolved-effect payloads remain restricted to recovery. External provider copies may remain." };
-    }
-    if (command.kind === "create_routine") {
-      try { new Intl.DateTimeFormat("en", { timeZone: command.timezone }).format(); } catch { return denied("Invalid timezone."); }
-      const routine: Routine = { id: uuid(), scopeId: scope.id, createdBy: userId, instruction: command.instruction, state: "active", timezone: command.timezone, nextAt: command.nextAt, intervalMs: command.intervalMs, budgetMicros: command.budgetMicros };
-      await db.query("INSERT INTO routines(workspace_id,scope_id,id,data) VALUES($1,$2,$3,$4)", [scope.workspaceId, scope.id, routine.id, JSON.stringify(routine)]);
-      await event(db, scope, null, userId, "routine_created", { routineId: routine.id, timezone: routine.timezone, utcOccurrence: routine.nextAt, intervalMs: routine.intervalMs, basis: "wall_clock" }, this.now());
-      return { kind: "accepted", message: `Wall-clock schedule saved in ${routine.timezone}. Runs at the same local time each interval.` };
-    }
-    if (command.kind === "set_routine") {
-      const routine = (await records(db, "routines", routineSchema, "scope_id=$1 AND id=$2", [scope.id, command.routineId]))[0];
-      if (!routine || routine.state === "revoked") return denied();
-      const occurrence = lastWallClockOccurrence(routine, this.now());
-      const nextAt = command.state === "active" && routine.nextAt <= this.now() ? nextWallClockInstant(occurrence, routine.intervalMs, routine.timezone) : routine.nextAt;
-      await save(db, "routines", { ...routine, state: command.state, nextAt });
-      await event(db, scope, null, userId, "routine_changed", { routineId: routine.id, state: command.state }, this.now());
-      return { kind: "accepted" };
-    }
-    if (command.kind === "revoke_grant") {
-      const grant = (await records(db, "grants", grantSchema, "scope_id=$1 AND id=$2", [scope.id, command.grantId]))[0];
-      if (!grant) return denied();
-      await save(db, "grants", { ...grant, active: false, revision: grant.revision + 1 });
-      await this.fenceScope(db, scope, "Connector grant revoked.");
-      await event(db, scope, null, userId, "grant_revoked", { grantId: grant.id }, this.now());
-      return { kind: "accepted" };
-    }
-    if (command.kind === "set_scope") {
-      if (command.workspacePublic !== undefined) {
-        const owner = first(await rows(db, "SELECT owner_id FROM workspaces WHERE id=$workspace AND id=$1", [scope.workspaceId], z.object({ owner_id: z.string() })));
-        if (owner.owner_id !== userId) return denied("Only the current workspace owner can change workspace sharing.");
-      }
-      const { kind: _kind, ...changes } = command;
-      const validScope: Scope = { ...scope, ...changes, policyRevision: scope.policyRevision + 1 };
-      await save(db, "scopes", validScope);
-      await this.fenceScope(db, validScope, "Scope policy changed.");
-      if (!validScope.active) for (const routine of await records(db, "routines", routineSchema, "scope_id=$1 AND data->>'state'='active'", [scope.id])) await save(db, "routines", { ...routine, state: "paused" });
-      await event(db, scope, null, userId, "scope_policy_changed", { revision: validScope.policyRevision, active: validScope.active }, this.now());
-      return { kind: "accepted" };
-    }
-    return denied();
+    const { kind: _kind, ...changes } = command;
+    const validScope: Scope = { ...scope, ...changes, policyRevision: scope.policyRevision + 1 };
+    await save(db, "scopes", validScope);
+    await this.fenceScope(db, validScope, "Scope policy changed.");
+    if (!validScope.active) for (const routine of await records(db, "routines", routineSchema, "scope_id=$1 AND data->>'state'='active'", [scope.id])) await save(db, "routines", { ...routine, state: "paused" });
+    await event(db, scope, null, userId, "scope_policy_changed", { revision: validScope.policyRevision, active: validScope.active }, this.now());
+    return { kind: "accepted" };
   }
   async invalidateContextDependencies(db: Db, scope: Scope, changedInputs: { sourceIds: string[]; memoryIds: string[] }): Promise<void> {
     const removed = new Set(changedInputs.sourceIds);
