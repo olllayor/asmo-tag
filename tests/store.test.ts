@@ -545,31 +545,23 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     expect(JSON.stringify(view)).not.toContain("NEVER_LOG_THIS_SECRET");
   });
 
-  it.each(["scope", "workspace"] as const)("preserves a recovered effect while %s admission prevents automatic task resumption", async capacity => {
+  it("resumes a recovered effect with one dispatch and the confirmed result in history", async () => {
     const draft = await draftWrite();
     await command({ kind: "decide", approvalId: draft.approval.id, decision: "approve" }, "manager");
     const dispatched = await claimEffect();
     await store.unknownEffect(dispatched, "Outcome awaiting positive reconciliation");
-    const groups = capacity === "scope" ? [scope] : Array.from({ length: 5 }, () => ({ ...scope, id: randomUUID(), chatId: randomUUID() }));
-    if (capacity === "workspace") await store.seed({ ...seed, scopes: groups, memberships: groups.map(group => ({ scopeId: group.id, userId: "member", role: "member" })), grants: [] });
-    const fillers = await Promise.all(groups.flatMap(group => Array.from({ length: 20 }, (_, index) => store.command({ scopeId: group.id, userId: "member", key: randomUUID(), command: { kind: "start", instruction: `Admission saturation ${index}`, topicId: null } }).then(receipt => ({ receipt, scopeId: group.id })))));
-    expect(fillers.every(filler => filler.receipt.kind === "accepted")).toBe(true);
+    const held = await store.task(scope.id, "member", draft.taskId);
+    expect(held.task.state).toBe("blocked");
+    expect(held.task.reason).toBe("External outcome unknown. Reconciliation required.");
     await store.finishEffect(dispatched, { providerId: "original-write-confirmed", url: null, content: "Original effect positively confirmed" });
     const recovered = await store.task(scope.id, "member", draft.taskId);
-    expect(recovered.task.state).toBe("blocked");
-    expect(recovered.task.reason).toContain(capacity === "scope" ? "Scope active-task limit reached." : "Workspace pending-task limit reached.");
+    expect(recovered.task.state).toBe("queued");
     expect(recovered.effects[0]?.state).toBe("succeeded");
     expect(recovered.effects[0]?.providerId).toBe("original-write-confirmed");
-    expect(recovered.events.some(event => event.kind === "recovery_admission_blocked")).toBe(true);
     expect(recovered.events.filter(event => event.kind === "effect_dispatched")).toHaveLength(1);
-    for (const filler of fillers) {
-      if (!filler.receipt.taskId) throw new Error("Filler task missing");
-      await store.command({ scopeId: filler.scopeId, userId: "member", key: randomUUID(), command: { kind: "stop", taskId: filler.receipt.taskId } });
-    }
-    expect((await command({ kind: "resume", taskId: draft.taskId })).kind).toBe("accepted");
     let next: ModelJob | null = null;
     for (let index = 0; index < 250; index += 1) {
-      const job = await store.claim("recovery-capacity-worker");
+      const job = await store.claim("recovery-worker");
       if (!job) break;
       if (job.kind === "delivery") await store.finishDelivery(job, ++deliveryMessageId);
       else if (job.kind === "model") { next = job; break; }
@@ -577,6 +569,20 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     }
     expect(next?.input.task.id).toBe(draft.taskId);
     expect(next?.input.history.flatMap(row => row.content).some(block => block.type === "tool_result" && block.content === "Original effect positively confirmed")).toBe(true);
+  });
+
+  it("skips a routine occurrence while the pending-job cap is saturated", async () => {
+    await command({ kind: "create_routine", instruction: "Capacity digest", timezone: "UTC", nextAt: now + 1000, intervalMs: 86_400_000, budgetMicros: 5000 }, "manager");
+    const filler = await start("Routine capacity filler");
+    for (let index = 0; index < 500; index += 1) expect((await command({ kind: "stop", taskId: filler })).kind).toBe("accepted");
+    now += 1001;
+    await store.materializeRoutines();
+    expect((await store.view(scope.id, "member")).tasks).toHaveLength(1);
+    const probe = new DatabaseSync(options.databasePath);
+    try {
+      const skipped = probe.prepare("SELECT count(*) AS count FROM events WHERE workspace_id=? AND json_extract(data,'$.kind')='routine_capacity_skipped'").get(seed.workspaceId) as { count: number } | undefined;
+      expect(skipped?.count).toBe(1);
+    } finally { probe.close(); }
   });
 
   it("reserves the workspace allowance atomically across concurrent tasks", async () => {
@@ -593,20 +599,6 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     expect(view.tasks.filter(task => task.task.state === "blocked")).toHaveLength(1);
     await store.finishModel(first, turn());
     expect((await store.view(limitedScope.id, "member")).usage.spentMicros).toBe(1000);
-  });
-
-  it("admits at most twenty active tasks per scope without reserving rejected work", async () => {
-    const receipts = await Promise.all(Array.from({ length: 21 }, (_, index) => command({ kind: "start", instruction: `Bounded task ${index}`, topicId: null })));
-    expect(receipts.filter(receipt => receipt.kind === "accepted")).toHaveLength(20);
-    expect(receipts.filter(receipt => receipt.kind === "denied" && receipt.message === "Scope active-task limit reached.")).toHaveLength(1);
-    const view = await store.view(scope.id, "member");
-    expect(view.tasks).toHaveLength(20);
-    expect(view.usage.heldMicros).toBe(0);
-    expect(view.tasks.flatMap(task => task.effects)).toHaveLength(0);
-    const firstTask = view.tasks[0]?.task;
-    if (!firstTask) throw new Error("Admitted task missing");
-    expect((await command({ kind: "stop", taskId: firstTask.id })).kind).toBe("accepted");
-    expect((await command({ kind: "start", instruction: "Capacity released by stop", topicId: null })).kind).toBe("accepted");
   });
 
   it("leases at most two model tasks per scope and defers a third worker", async () => {
@@ -632,17 +624,6 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     const third = await claimModel();
     expect([first.input.task.id, second.input.task.id]).not.toContain(third.input.task.id);
     expect((await store.view(scope.id, "member")).usage.heldMicros).toBe(2000);
-  });
-
-  it("bounds pending tasks across groups at the workspace admission limit", async () => {
-    const groups = [scope, ...Array.from({ length: 4 }, () => ({ ...scope, id: randomUUID(), chatId: randomUUID() }))];
-    await store.seed({ ...seed, scopes: groups.slice(1), memberships: groups.slice(1).map(group => ({ scopeId: group.id, userId: "member", role: "member" })), grants: [] });
-    const receipts = await Promise.all(groups.flatMap(group => Array.from({ length: 20 }, (_, index) => store.command({ scopeId: group.id, userId: "member", key: randomUUID(), command: { kind: "start", instruction: `Workspace capacity fixture ${index}`, topicId: null } }))));
-    expect(receipts.filter(receipt => receipt.kind === "accepted")).toHaveLength(100);
-    const rejected = await store.command({ scopeId: otherScope.id, userId: "other", key: randomUUID(), command: { kind: "start", instruction: "Beyond workspace cap", topicId: null } });
-    expect(rejected).toEqual({ kind: "denied", message: "Workspace pending-task limit reached." });
-    expect((await store.view(otherScope.id, "other")).tasks).toHaveLength(0);
-    expect((await store.view(scope.id, "member")).usage.heldMicros).toBe(0);
   });
 
   it("caps pending jobs at five hundred while keeping Stop and cleanup commands available", async () => {

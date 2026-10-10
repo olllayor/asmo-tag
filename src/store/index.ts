@@ -51,8 +51,6 @@ function canonical(value: unknown): string {
 const digest = (value: unknown) => createHash("sha256").update(canonical(value)).digest("hex");
 const liveStates = new Set<Task["state"]>(["queued", "running", "waiting_for_input", "waiting_for_approval"]);
 const manager = (role: string | null) => role === "owner" || role === "manager";
-const activeTaskLimitPerScope = 20;
-const pendingTaskLimitPerWorkspace = 100;
 const pendingJobLimitPerWorkspace = 500;
 const modelLeaseLimitPerScope = 2;
 const deferredClaimMs = 250;
@@ -265,10 +263,7 @@ class SQLiteStore implements Store {
     await progress(db, scope, task, "I'm still working on this.", this.now(), 8000);
     return task;
   }
-  async admissionReason(db: Db, scope: Scope, excludedTaskId: string | null, requiredJobs: number): Promise<string | null> {
-    const counts = first(await rows(db, "SELECT count(*) FILTER(WHERE scope_id=$1) AS scoped,count(*) AS workspace FROM tasks WHERE workspace_id=$workspace AND data->>'state' IN ('queued','running','waiting_for_input','waiting_for_approval','stopping') AND ($2 IS NULL OR id<>$2)", [scope.id, excludedTaskId], z.object({ scoped: z.coerce.number().int(), workspace: z.coerce.number().int() })));
-    if (counts.scoped >= activeTaskLimitPerScope) return "Scope active-task limit reached.";
-    if (counts.workspace >= pendingTaskLimitPerWorkspace) return "Workspace pending-task limit reached.";
+  async admissionReason(db: Db, requiredJobs: number): Promise<string | null> {
     const pending = first(await rows(db, "SELECT count(*) AS count FROM jobs WHERE workspace_id=$workspace AND state IN ('ready','leased')", [], z.object({ count: z.coerce.number().int() }))).count;
     return pending + requiredJobs > pendingJobLimitPerWorkspace ? "Workspace pending-job limit reached." : null;
   }
@@ -326,13 +321,13 @@ class SQLiteStore implements Store {
   async applyCommand(db: Db, scope: Scope, userId: string, role: string, command: Command): Promise<Receipt> {
     const denied = (message = "Action denied."): Receipt => ({ kind: "denied", message });
     if (!scope.active && !["set_scope", "stop", "cancel", "forget_sources", "correct_memory", "set_memory"].includes(command.kind)) return denied("Scope inactive.");
-    if (command.kind === "start") { const reason = await this.admissionReason(db, scope, null, 3); if (reason) return denied(reason); const task = await this.createTask(db, scope, userId, command.instruction, command.topicId); return { kind: "accepted", taskId: task.id }; }
+    if (command.kind === "start") { const reason = await this.admissionReason(db, 3); if (reason) return denied(reason); const task = await this.createTask(db, scope, userId, command.instruction, command.topicId); return { kind: "accepted", taskId: task.id }; }
     if (["steer", "stop", "resume", "cancel"].includes(command.kind) && "taskId" in command) {
       const task = (await records(db, "tasks", taskSchema, "scope_id=$1 AND id=$2", [scope.id, command.taskId]))[0];
       if (!task) return denied();
       if (task.state === "canceled") return denied("Task canceled. Start a new task.");
       if (command.kind === "steer") {
-        if (!liveStates.has(task.state)) { const reason = await this.admissionReason(db, scope, task.id, 1); if (reason) return denied(reason); }
+        if (!liveStates.has(task.state)) { const reason = await this.admissionReason(db, 1); if (reason) return denied(reason); }
         const updated: Task = { ...task, epoch: task.epoch + 1, revision: task.revision + 1, state: "queued", reason: null };
         await save(db, "tasks", updated);
         await this.invalidateEffects(db, scope, updated, "Action invalidated by steering.");
@@ -354,7 +349,7 @@ class SQLiteStore implements Store {
         await progress(db, scope, updated, settledProgress(updated), this.now());
       } else {
         if (!["paused", "stopping", "blocked", "failed", "waiting_for_input"].includes(task.state)) return denied("Task is not resumable.");
-        const admission = await this.admissionReason(db, scope, task.id, 1);
+        const admission = await this.admissionReason(db, 1);
         if (admission) return denied(admission);
         const updated: Task = { ...task, epoch: task.epoch + 1, revision: task.revision + 1, state: "queued", reason: null };
         await save(db, "tasks", updated);
@@ -640,7 +635,7 @@ class SQLiteStore implements Store {
     const complete = await this.completeToolResults(db, scope, task);
     if (complete && (liveStates.has(task.state) || (task.state === "blocked" && task.reason === "External outcome unknown. Reconciliation required." && scope.active && await this.requesterAllowed(db, scope, task)))) {
       if (task.state === "blocked") {
-        const admission = await this.admissionReason(db, scope, task.id, 1);
+        const admission = await this.admissionReason(db, 1);
         if (admission) {
           const blocked: Task = { ...task, reason: `${admission} Resume after capacity becomes available.` };
           await save(db, "tasks", blocked);
@@ -669,7 +664,7 @@ class SQLiteStore implements Store {
         const occurrence = lastWallClockOccurrence(routine, this.now());
         const existing = await rows(db, "SELECT task_id FROM occurrences WHERE workspace_id=$workspace AND routine_id=$1 AND at=$2", [routine.id, occurrence], z.object({ task_id: z.string() }));
         if (!existing.length) {
-          const admission = await this.admissionReason(db, scope, null, 2);
+          const admission = await this.admissionReason(db, 2);
           if (admission) await event(db, scope, null, null, "routine_capacity_skipped", { routineId: routine.id, occurrence, reason: admission }, this.now());
           else {
             const task = await this.createTask(db, scope, `routine:${routine.id}`, routine.instruction, null, routine.budgetMicros);
