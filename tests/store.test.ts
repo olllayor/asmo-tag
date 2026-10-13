@@ -164,6 +164,53 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     expect((await provider.turn(next.input, new AbortController().signal)).outcome).toBe("complete");
   });
 
+  it("answers a greeting once without model work or task progress, then accepts a reply as work", async () => {
+    const update = message("@asmo_ai_bot hi", 100, { mentioned: true, topicId: 42 });
+    expect(await store.ingest(update)).toEqual({ kind: "accepted" });
+    expect((await store.view(scope.id, "member")).tasks).toHaveLength(0);
+    expect(await store.claim("execution", "model")).toBeNull();
+    const greeting = await store.claim("outbox", "delivery");
+    if (greeting?.kind !== "delivery") throw new Error("Greeting missing");
+    expect(greeting.delivery).toMatchObject({ text: "Hi!", taskId: null, topicId: 42, replyTo: 100, buttons: [] });
+    expect(greeting.delivery.purpose).toBeUndefined();
+    await store.finishDelivery(greeting, 900);
+    expect((await store.ingest(update)).kind).toBe("duplicate");
+    expect((await store.ingest(message(update.text, 100, { mentioned: true }))).kind).toBe("duplicate");
+    now += 8001;
+    expect(await store.claim("outbox", "delivery")).toBeNull();
+    expect(await store.claim("execution", "model")).toBeNull();
+    const followup = await store.ingest(message("Read fixture/engineering issues", 101, { replyTo: 900, topicId: 42 }));
+    expect(followup.taskId).toBeDefined();
+    expect((await claimModel()).input.task.instruction).toBe("Read fixture/engineering issues");
+  });
+
+  it("ignores unaddressed greetings and replies to another member's greeting", async () => {
+    expect((await store.ingest(message("hi", 100))).kind).toBe("ignored");
+    expect((await store.ingest(message("Read fixture/engineering issues", 101, { replyTo: 100 }))).kind).toBe("ignored");
+    expect((await store.view(scope.id, "member")).tasks).toHaveLength(0);
+    expect(await store.claim("outbox")).toBeNull();
+  });
+
+  it.each([
+    { text: "@asmo_ai_bot hi, read fixture/engineering issues" },
+    { text: "hi", file: { name: "report.txt", text: "Investigate this report" } },
+  ])("keeps greetings with instructions or attachments on the task path: $text", async input => {
+    const receipt = await store.ingest(message(input.text, 100, { mentioned: true, ...("file" in input ? { file: input.file } : {}) }));
+    expect(receipt.taskId).toBeDefined();
+    const acknowledgement = await store.claim("outbox", "delivery");
+    if (acknowledgement?.kind !== "delivery") throw new Error("Acknowledgement missing");
+    expect(acknowledgement.delivery).toMatchObject({ text: "On it.", taskId: receipt.taskId, purpose: "acknowledgement" });
+    expect(await store.claim("execution", "model")).not.toBeNull();
+  });
+
+  it.each([["Salom! @asmo_ai_bot", "Salom!"], ["@asmo_ai_bot Привет!", "Привет!"]])("answers a standalone greeting in its language: %s", async (text, reply) => {
+    expect(await store.ingest(message(text, 100, { mentioned: true }))).toEqual({ kind: "accepted" });
+    const greeting = await store.claim("outbox", "delivery");
+    if (greeting?.kind !== "delivery") throw new Error("Greeting missing");
+    expect(greeting.delivery.text).toBe(reply);
+    expect(await store.claim("execution", "model")).toBeNull();
+  });
+
   it("acknowledges a quick ask and delivers a plain linked answer while retaining coverage in the inspector", async () => {
     const receipt = await store.ingest(message("Say hello", 100, { mentioned: true }));
     const acknowledgement = await store.claim("outbox", "delivery");
