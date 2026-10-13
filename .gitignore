@@ -16,6 +16,8 @@ coverage/
 # local runtime and agent scratch
 work/
 .learnings/
+.delta/
+.vitest/
 
 # sqlite artifacts
 *.sqlite

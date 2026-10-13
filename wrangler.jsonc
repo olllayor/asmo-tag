@@ -1,0 +1,47 @@
+{
+  "name": "asmo-tag-edge",
+  "main": "src/edge/gateway.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "asmo-tag-d1",
+      "database_id": "438c300a-aa39-423f-92ef-4e6130829f7f",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "KV",
+      "id": "493e8b0637ca46afb1d26985e1e3ce6c"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "R2",
+      "bucket_name": "asmo-tag-artifacts"
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "QUEUE",
+        "queue": "asmo-tag-jobs"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "asmo-tag-jobs",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5
+      }
+    ]
+  },
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
+  "observability": {
+    "enabled": true
+  }
+}

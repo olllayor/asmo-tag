@@ -19,6 +19,17 @@ async function main() {
     return;
   }
   if (action === "migrate") {
+    // ASMO_D1_COMMAND runs the schema through the wrangler CLI against a remote D1 database.
+    // The Worker binding form cannot be reached from Node, so the edge schema is applied by
+    // `wrangler d1 execute` instead of silently being left to the first webhook.
+    const d1Command = process.env.ASMO_D1_COMMAND;
+    if (d1Command) {
+      const { execFileSync } = await import("node:child_process");
+      const [database, ...rest] = d1Command.split(/\s+/).filter(Boolean);
+      if (!database) throw new Error("ASMO_D1_COMMAND must name a D1 database, for example: wrangler d1 execute asmo-tag-d1 --remote");
+      execFileSync("npx", ["wrangler", "d1", "execute", database, ...rest.length ? rest : ["--remote"], "--file", "migrations/0001-edge-schema.sql"], { stdio: "inherit" });
+      console.log("Asmo D1 migration passed."); return;
+    }
     const path = process.env.ASMO_DATABASE_PATH;
     if (!path) throw new Error("Missing configuration: ASMO_DATABASE_PATH");
     await migrateDatabase(path);
