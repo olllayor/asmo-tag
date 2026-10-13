@@ -16,7 +16,7 @@ type DeliveryJob = Extract<Job, { kind: "delivery" }>;
 
 describe("SQLite task lifecycle with simulated integrations", () => {
   let store: Store;
-  let options: StoreOptions;
+  let options: StoreOptions & { databasePath: string };
   let seed: Seed;
   let scope: Scope;
   let otherScope: Scope;
@@ -728,8 +728,11 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     }
     expect(released).toBeGreaterThan(0);
     expect(released).toBeLessThanOrEqual(500);
+    // Held jobs self-heal: releaseHeldJobs promotes them back to ready with a future
+    // ready_at carrying the backoff. So the invariant is that nothing is claimable, not that
+    // nothing sits in ready.
     const db = new DatabaseSync(options.databasePath);
-    try { expect(db.prepare("SELECT count(*) AS count FROM jobs WHERE state IN ('ready','leased')").get()?.count).toBe(0); }
+    try { expect(db.prepare("SELECT count(*) AS count FROM jobs WHERE state='leased' OR (state='ready' AND ready_at<=?)").get(now)?.count).toBe(0); }
     finally { db.close(); }
     expect((await command({ kind: "resume", taskId })).kind).toBe("accepted");
     const resumed = await claimModel();
@@ -1067,4 +1070,134 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     } finally { db.close(); }
   });
 
+});
+
+describe("Held job release (L20)", () => {
+  it("promotes a held job back to ready with backoff once its condition clears", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "asmo-held-"));
+    const options: StoreOptions & { databasePath: string } = {
+      databasePath: join(directory, "held.sqlite"),
+      modelReserveMicros: 1000, maxOutputTokens: 2000, maxTurns: 12, taskBudgetMicros: 20_000, leaseMs: 10_000, simulated: true, clock: () => Date.now(),
+    };
+    const store = await openStore(options);
+    const workspaceId = randomUUID();
+    const scopeId = randomUUID();
+    await store.seed({
+      botId: randomUUID(), workspaceId, name: "Held", ownerId: "owner", budgetMicros: 200_000,
+      scopes: [{ id: scopeId, workspaceId, kind: "group", chatId: "-1007", ownerId: null, name: "Held", active: true, workspacePublic: false, timezone: "UTC", policyRevision: 1, collectedSince: Date.now(), budgetMicros: 100_000 }],
+      memberships: [{ scopeId, userId: "member", role: "member" }], grants: [],
+    });
+    await store.command({ scopeId, userId: "member", key: "k1", command: { kind: "start", instruction: "held work", topicId: null } });
+    // Park the job the way any hold site does, then prove the sweep is what moves it back.
+    // Creating the hold through a real hold path would couple this test to why a job was
+    // held, when what L20 needs covered is that a held job is never stranded.
+    const db = new DatabaseSync(options.databasePath);
+    try {
+      db.exec("UPDATE jobs SET state='held',ready_at=1");
+      const heldBefore = db.prepare("SELECT count(*) AS count FROM jobs WHERE state='held'").get()?.count ?? 0;
+      expect(heldBefore).toBeGreaterThan(0);
+      await store.materializeRoutines();
+      // Every held job is promoted; none is left stranded.
+      expect(db.prepare("SELECT count(*) AS count FROM jobs WHERE state='held'").get()?.count).toBe(0);
+      expect(db.prepare("SELECT count(*) AS count FROM jobs WHERE state='ready'").get()?.count).toBe(heldBefore);
+      // The backoff rides on ready_at, so the jobs are ready but not claimable yet.
+      const soonest = db.prepare("SELECT MIN(ready_at) AS at FROM jobs WHERE state='ready'").get() as { at: number };
+      expect(soonest.at).toBeGreaterThan(Date.now() - 1);
+      // A second sweep must not duplicate the job or reset the backoff. Comparing only the
+      // row count would still pass if the sweep re-promoted and made the job immediately
+      // claimable, so pin the timestamp too.
+      const jobsBefore = db.prepare("SELECT count(*) AS count FROM jobs").get()?.count;
+      await store.materializeRoutines();
+      expect(db.prepare("SELECT count(*) AS count FROM jobs").get()?.count).toBe(jobsBefore);
+      expect(db.prepare("SELECT MIN(ready_at) AS at FROM jobs WHERE state='ready'").get()?.at).toBe(soonest.at);
+      // None of them is claimable yet: the backoff is still in the future.
+      expect(db.prepare("SELECT count(*) AS count FROM jobs WHERE state='ready' AND ready_at<=?").get(Date.now())?.count).toBe(0);
+    } finally { db.close(); }
+    await store.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  it("resumes a blocked model task after its hold is released and blocking condition clears", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "asmo-held-resume-"));
+    let currentTime = 1_000_000;
+    const options: StoreOptions & { databasePath: string } = {
+      databasePath: join(directory, "held-resume.sqlite"),
+      modelReserveMicros: 1000, maxOutputTokens: 2000, maxTurns: 12, taskBudgetMicros: 20_000, leaseMs: 10_000, simulated: true, clock: () => currentTime,
+    };
+    const store = await openStore(options);
+    const workspaceId = randomUUID();
+    const scopeId = randomUUID();
+    await store.seed({
+      botId: randomUUID(), workspaceId, name: "HeldResume", ownerId: "owner", budgetMicros: 1500,
+      scopes: [{ id: scopeId, workspaceId, kind: "group", chatId: "-1008", ownerId: null, name: "HeldResume", active: true, workspacePublic: false, timezone: "UTC", policyRevision: 1, collectedSince: currentTime, budgetMicros: 1500 }],
+      memberships: [{ scopeId, userId: "member", role: "member" }], grants: [],
+    });
+    await store.command({ scopeId, userId: "member", key: "k1", command: { kind: "start", instruction: "task one", topicId: null } });
+    await store.command({ scopeId, userId: "member", key: "k2", command: { kind: "start", instruction: "task two", topicId: null } });
+
+    // Drain deliveries until we get the first model job
+    let firstModel: ModelJob | null = null;
+    for (let i = 0; i < 20; i++) {
+      const job = await store.claim("worker");
+      if (job?.kind === "delivery") {
+        await store.finishDelivery(job, i + 1);
+      } else if (job?.kind === "model") {
+        firstModel = job;
+        break;
+      }
+    }
+    expect(firstModel).not.toBeNull();
+    expect(firstModel?.input.task.instruction).toBe("task one");
+
+    // Task two tries to claim, but budget is exhausted (1000 held + 1000 needed > 1500)
+    for (let i = 0; i < 20; i++) {
+      const job = await store.claim("worker");
+      if (job?.kind === "delivery") {
+        await store.finishDelivery(job, i + 100);
+      } else if (job?.kind === "model") {
+        throw new Error("Task two should not have been claimable yet");
+      } else {
+        break;
+      }
+    }
+
+    // Task two must be blocked with reason
+    const viewBlocked = await store.view(scopeId, "member");
+    const taskTwoBlocked = viewBlocked.tasks.find(t => t.task.instruction === "task two");
+    expect(taskTwoBlocked?.task.state).toBe("blocked");
+    expect(taskTwoBlocked?.task.reason).toBe("Budget reservation unavailable.");
+
+    // Task one finishes and only consumes 200 micros, freeing the 1000 held allowance
+    await store.finishModel(firstModel!, {
+      message: { role: "assistant", content: [{ type: "text", text: "task one done" }] },
+      usage: { inputTokens: 10, outputTokens: 10, costMicros: 200, simulated: true, pricingRevision: "fixture-v1" },
+      requestId: randomUUID(),
+      outcome: "complete",
+      sourceIds: [],
+      limitations: [],
+    });
+
+    // Advance clock past the backoff window and run sweep
+    currentTime += 5000;
+    await store.materializeRoutines();
+
+    // Now task two should be claimable and resume to running
+    let secondModel: ModelJob | null = null;
+    for (let i = 0; i < 20; i++) {
+      const job = await store.claim("worker");
+      if (job?.kind === "delivery") {
+        await store.finishDelivery(job, i + 200);
+      } else if (job?.kind === "model") {
+        secondModel = job;
+        break;
+      }
+    }
+    expect(secondModel).not.toBeNull();
+    expect(secondModel?.input.task.instruction).toBe("task two");
+    expect(secondModel?.input.task.state).toBe("running");
+    expect(secondModel?.input.task.reason).toBeNull();
+
+    await store.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
 });

@@ -4,31 +4,24 @@ import { closeSync, mkdirSync, openSync, realpathSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import type { z } from "zod";
 import { migrationSql, schemaVersion } from "./schema.js";
+import { binding, decode } from "./sql.js";
+import type { Db, Row } from "./sql.js";
+import { inD1Transaction } from "./d1.js";
+import type { D1Connection } from "./d1.js";
 
-type Row = Record<string, unknown>;
-export interface Db {
-  readonly workspaceId: string;
-  query<T extends Row = Row>(sql: string, parameters?: unknown[]): Promise<{ rows: T[] }>;
-}
+// Pure SQL helpers live in ./sql.js so the edge worker can use them without pulling in
+// node:sqlite/node:fs. They are re-exported here for existing importers.
+export { binding, decode, prepareSql } from "./sql.js";
+export type { Db, Row } from "./sql.js";
+
 const gates = new Map<string, Promise<void>>();
-const jsonColumns = new Set(["data", "receipt", "sources", "memories"]);
-const booleanColumns = new Set(["deleted", "redacted", "settled", "expired"]);
-function binding(value: unknown): SQLInputValue {
-  if (value === null || value === undefined) return null;
-  if (typeof value === "boolean") return Number(value);
-  if (typeof value === "string" || typeof value === "number" || typeof value === "bigint") return value;
-  if (Array.isArray(value)) return JSON.stringify(value);
-  throw new Error("Unsupported SQLite binding");
-}
-function decode(row: Row): Row {
-  return Object.fromEntries(Object.entries(row).map(([key, value]) => [key, jsonColumns.has(key) && typeof value === "string" ? JSON.parse(value) as unknown : booleanColumns.has(key) ? Boolean(value) : value]));
-}
+
 export class Connection {
   readonly database: DatabaseSync;
   readonly path: string;
   migrated = false;
   constructor(databasePath: string) {
-    if (!databasePath.trim() || /^[a-z][a-z0-9+.-]*:\/\//i.test(databasePath)) throw new Error("ASMO_DATABASE_PATH must be a local SQLite file path");
+    if (!databasePath.trim() || /^[a-z][a-z0-9+.-]*:\/\/$/i.test(databasePath) || /^[a-z][a-z0-9+.-]*:\/\//i.test(databasePath)) throw new Error("ASMO_DATABASE_PATH must be a local SQLite file path");
     const absolute = resolve(databasePath);
     mkdirSync(dirname(absolute), { recursive: true });
     closeSync(openSync(absolute, "a", 0o600));
@@ -49,38 +42,56 @@ export class Connection {
   async discover<T>(sql: string, parameters: unknown[], schema: z.ZodType<T>): Promise<T[]> {
     return this.query(sql, parameters).rows.map(row => schema.parse(row));
   }
+  // Applies the schema on first use. Callers run this inside their transaction so a partial
+  // migration is rolled back with it.
+  migrate(): void {
+    if (this.migrated) return;
+    const row = this.database.prepare("PRAGMA user_version").get();
+    const currentVersion = Number(row?.user_version);
+    if (currentVersion > schemaVersion) throw new Error("SQLite schema is newer than this application");
+    if (currentVersion === 0) {
+      this.database.exec(migrationSql);
+      this.database.exec(`PRAGMA user_version=${schemaVersion}`);
+    }
+    this.migrated = true;
+  }
   close(): void { this.database.close(); }
 }
+
 export const connectDatabase = (path: string): Connection => new Connection(path);
-export async function inDatabaseTransaction<T>(connection: Connection, operation: () => Promise<T>): Promise<T> {
-  const previous = gates.get(connection.path) ?? Promise.resolve();
+
+// Local SQLite runs the operation inside BEGIN IMMEDIATE, so the whole unit is atomic and
+// rolls back on failure. D1 has no interactive transactions: the only atomic unit is a
+// batch(), and every store callback reads rows it wrote earlier in the same callback, so a
+// batch cannot substitute for one. The D1 branch therefore serializes callbacks inside this
+// isolate and lets each statement commit on its own. A failure mid-callback leaves the
+// statements that already ran committed; there is no rollback. Cross-isolate safety comes
+// from the conditional updates in claim/finish*, not from this gate.
+export async function inDatabaseTransaction<T>(connection: Connection | D1Connection, operation: () => Promise<T>): Promise<T> {
+  if ("isD1" in connection && connection.isD1) {
+    return inD1Transaction(connection, operation);
+  }
+
+  const conn = connection as Connection;
+  const previous = gates.get(conn.path) ?? Promise.resolve();
   let release!: () => void;
   const pending = new Promise<void>(accept => { release = accept; });
   const gate = previous.then(() => pending);
-  gates.set(connection.path, gate);
+  gates.set(conn.path, gate);
   await previous;
   try {
-    if (!connection.migrated) {
-      connection.database.exec("PRAGMA journal_mode=DELETE;");
+    if (!conn.migrated) {
+      conn.database.exec("PRAGMA journal_mode=DELETE;");
     }
-    connection.database.exec("BEGIN IMMEDIATE");
+    conn.database.exec("BEGIN IMMEDIATE");
     try {
-      if (!connection.migrated) {
-        const row = connection.database.prepare("PRAGMA user_version").get();
-        const currentVersion = Number(row?.user_version);
-        if (currentVersion > schemaVersion) throw new Error("SQLite schema is newer than this application");
-        if (currentVersion === 0) {
-          connection.database.exec(migrationSql);
-          connection.database.exec(`PRAGMA user_version=${schemaVersion}`);
-        }
-      }
+      conn.migrate();
       const result = await operation();
-      connection.database.exec("COMMIT");
-      connection.migrated = true;
+      conn.database.exec("COMMIT");
       return result;
-    } catch (error) { connection.database.exec("ROLLBACK"); throw error; }
+    } catch (error) { conn.database.exec("ROLLBACK"); throw error; }
   } finally {
     release();
-    if (gates.get(connection.path) === gate) gates.delete(connection.path);
+    if (gates.get(conn.path) === gate) gates.delete(conn.path);
   }
 }
