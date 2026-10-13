@@ -742,12 +742,25 @@ class SQLiteStore implements Store {
   // Without this sweep a temporary denial (a scope paused for an afternoon, a workspace that
   // hit the pending-job cap, an unknown effect awaiting reconciliation) permanently strands
   // the job, and the user is never told.
+  //
+  // Two guards keep the release bounded. Available capacity is tracked per workspace, so
+  // releasing cannot push any workspace past the pending-job limit queue() enforces. And
+  // the sweep runs for delivery claims as well, which never call materializeRoutines.
   async releaseHeldJobs(): Promise<void> {
-    const candidates = await this.connection.discover("SELECT workspace_id,id,attempts FROM jobs WHERE ($2 IS NULL OR workspace_id IN (SELECT value FROM json_each($2))) AND state='held' ORDER BY attempts,ready_at LIMIT $3", [this.now(), this.options.workspaceIds ?? null, heldReleaseBatchSize], z.object({ workspace_id: z.string(), id: z.string(), attempts: z.number() }));
+    const counts = await this.connection.discover("SELECT workspace_id, count(*) AS count FROM jobs WHERE ($1 IS NULL OR workspace_id IN (SELECT value FROM json_each($1))) AND state IN ('ready','leased') GROUP BY workspace_id", [this.options.workspaceIds ?? null], z.object({ workspace_id: z.string(), count: z.coerce.number().int() }));
+    const availableCapacity = new Map<string, number>();
+    for (const row of counts) {
+      availableCapacity.set(row.workspace_id, Math.max(0, pendingJobLimitPerWorkspace - row.count));
+    }
+    const candidates = await this.connection.discover("SELECT j.workspace_id AS workspace_id,j.id AS id,j.attempts AS attempts,j.task_id AS task_id FROM jobs j WHERE ($1 IS NULL OR j.workspace_id IN (SELECT value FROM json_each($1))) AND j.state='held' ORDER BY j.attempts,j.ready_at LIMIT $2", [this.options.workspaceIds ?? null, heldReleaseBatchSize], z.object({ workspace_id: z.string(), id: z.string(), attempts: z.number(), task_id: z.string().nullable() }));
     for (const candidate of candidates) {
+      const remaining = availableCapacity.get(candidate.workspace_id) ?? pendingJobLimitPerWorkspace;
+      if (remaining <= 0) continue;
+      availableCapacity.set(candidate.workspace_id, remaining - 1);
       const backoff = heldReleaseBackoffMs[Math.min(candidate.attempts, heldReleaseBackoffMs.length - 1)] ?? 0;
+      const releasedAt = this.now() + backoff;
       // ready_at carries the next eligible instant, so the backoff needs no extra column.
-      await this.connection.query("UPDATE jobs SET state='ready',ready_at=$3,token=NULL,worker_id=NULL,expires_at=NULL WHERE workspace_id=$workspace AND id=$1 AND state='held'", [candidate.id, this.now(), this.now() + backoff], candidate.workspace_id);
+      await this.connection.query("UPDATE jobs SET state='ready',ready_at=$3,token=NULL,worker_id=NULL,expires_at=NULL WHERE workspace_id=$workspace AND id=$1 AND state='held'", [candidate.id, this.now(), releasedAt], candidate.workspace_id);
     }
   }
   async materializeRoutines(): Promise<void> {
@@ -811,7 +824,12 @@ class SQLiteStore implements Store {
     return { task, history: await history(db, task.id), sources, memories, collectedSince: scope.collectedSince, tools, maxOutputTokens: this.options.maxOutputTokens };
   }
   async claim(workerId: string, kind?: Job["kind"]): Promise<Job | null> {
-    if (kind !== "delivery") await this.materializeRoutines();
+    // Held jobs are not claim candidates, so a worker that only polls one kind still has to
+    // run the release sweep or jobs of that kind never come back. materializeRoutines()
+    // already sweeps on the non-delivery path and from the scheduler loop; delivery claims
+    // need it explicitly.
+    if (kind === "delivery") await this.releaseHeldJobs();
+    else await this.materializeRoutines();
     for (let attempt = 0; attempt < 40; attempt += 1) {
       const token = uuid();
       const job = await this.isolated(async (): Promise<Job | null | undefined> => {
@@ -863,7 +881,7 @@ class SQLiteStore implements Store {
         await this.expireReservations(db, scope, task, token);
         const activeModels = first(await rows(db, "SELECT count(*) AS count FROM jobs WHERE workspace_id=$workspace AND scope_id=$1 AND kind='model' AND state='leased' AND expires_at>$2", [scope.id, this.now()], z.object({ count: z.coerce.number().int() }))).count;
         if (activeModels > modelLeaseLimitPerScope) { await db.query("UPDATE jobs SET state='ready',ready_at=$2,token=NULL,worker_id=NULL,expires_at=NULL WHERE workspace_id=$workspace AND id=$1 AND token=$3", [row.id, this.now() + deferredClaimMs, token]); return null; }
-        if (!scope.active || !liveStates.has(task.state) || !await this.requesterAllowed(db, scope, task)) { await db.query("UPDATE jobs SET state='held' WHERE workspace_id=$workspace AND id=$1", [row.id]); if (liveStates.has(task.state)) await save(db, "tasks", { ...task, state: "blocked", reason: "Current scope or requester access unavailable." }); await this.advance(db, scope, task); return null; }
+        const resumableBlocked = task.state === "blocked" && task.reason !== "Task turn limit reached."; if (!scope.active || (!liveStates.has(task.state) && !resumableBlocked) || !await this.requesterAllowed(db, scope, task)) { await db.query("UPDATE jobs SET state='held' WHERE workspace_id=$workspace AND id=$1", [row.id]); if (liveStates.has(task.state) || task.state === "blocked") await save(db, "tasks", { ...task, state: "blocked", reason: "Current scope or requester access unavailable." }); await this.advance(db, scope, task); return null; }
         if (!await this.completeToolResults(db, scope, task)) { await db.query("UPDATE jobs SET state='held' WHERE workspace_id=$workspace AND id=$1", [row.id]); const effects = await records(db, "effects", effectSchema, "task_id=$1 AND data->>'state'='unknown'", [task.id]); if (effects.length) await save(db, "tasks", { ...task, state: "blocked", reason: "External outcome unknown. Reconciliation required." }); return null; }
         await this.flushNotes(db, task);
         const workspace = first(await rows(db, "SELECT budget,held,spent,authority_revision FROM workspaces WHERE id=$workspace AND id=$1", [scope.workspaceId], workspaceRowSchema));
