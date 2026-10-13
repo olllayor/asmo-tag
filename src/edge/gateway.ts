@@ -114,19 +114,27 @@ function edgeConfigProblem(env: EdgeEnv): string | null {
   if (!env.TELEGRAM_WEBHOOK_SECRET) return "Missing configuration: TELEGRAM_WEBHOOK_SECRET";
   if (!webhookSecretPattern.test(env.TELEGRAM_WEBHOOK_SECRET)) return "TELEGRAM_WEBHOOK_SECRET must contain 16 to 256 safe characters.";
   if (!env.TELEGRAM_BOT_TOKEN?.trim()) return "Missing configuration: TELEGRAM_BOT_TOKEN";
+  if (!env.TELEGRAM_BOT_USERNAME?.trim()) return "Missing configuration: TELEGRAM_BOT_USERNAME (required to match @mentions in groups)";
   return null;
 }
 
 // The bot id is the part of the token before the colon. Without it the worker cannot match
 // @mentions or text_mention entities, so a missing or malformed token returns null instead
 // of a placeholder identity that silently drops every group update.
+// The bot username is required, not optional. normalizeUpdate matches a group @mention by
+// comparing the entity text to `@${bot.username.toLowerCase()}`, so a placeholder value that
+// differs from the real bot username makes every group mention fail to match and the bot
+// goes silent in groups with no error anywhere. DMs do not need it, which is exactly why
+// the failure would look unexplained.
+const fallbackBotUsername = "asmo_bot";
+
 export function resolveBotIdentity(env: EdgeEnv): { id: string; username: string } | null {
   const token = env.TELEGRAM_BOT_TOKEN?.trim() ?? "";
   const separator = token.indexOf(":");
   if (separator <= 0 || separator === token.length - 1) return null;
   return {
     id: env.TELEGRAM_BOT_ID ?? token.slice(0, separator),
-    username: env.TELEGRAM_BOT_USERNAME ?? "asmo_bot",
+    username: env.TELEGRAM_BOT_USERNAME ?? fallbackBotUsername,
   };
 }
 

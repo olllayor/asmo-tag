@@ -799,10 +799,12 @@ class SQLiteStore implements Store {
         if (!location) return undefined;
         const db = this.connection.context(location.workspace_id);
         const scope = first(await records(db, "scopes", scopeSchema, "id=$1", [location.scope_id]));
-        // The state guard makes the lease a compare-and-swap. D1 has no interactive
-        // transaction to hold a write lock across statements, so without it two isolates
-        // can lease the same job and both run it.
-        const leased = await rows(db, "UPDATE jobs SET state='leased',token=$2,worker_id=$3,expires_at=$4,attempts=attempts+1 WHERE workspace_id=$workspace AND id=$1 AND (state='ready' OR (state='leased' AND expires_at<=$5)) RETURNING *", [location.id, token, workerId, this.now() + this.options.leaseMs, this.now()], jobRowSchema);
+        // The guard makes the lease a compare-and-swap. D1 has no interactive transaction to
+        // hold a write lock across statements, so without it two isolates can lease the same
+        // job and both run it. The guard repeats the candidate predicate exactly, including
+        // ready_at: another isolate may defer a selected ready job between the candidate read
+        // and this UPDATE, and a state-only guard would still lease the deferred job.
+        const leased = await rows(db, "UPDATE jobs SET state='leased',token=$2,worker_id=$3,expires_at=$4,attempts=attempts+1 WHERE workspace_id=$workspace AND id=$1 AND ((state='ready' AND ready_at<=$5) OR (state='leased' AND expires_at<=$5)) RETURNING *", [location.id, token, workerId, this.now() + this.options.leaseMs, this.now()], jobRowSchema);
         const row = leased[0];
         if (!row || row.token !== token) return null;
         const lease = { id: row.id, token, workerId, expiresAt: row.expires_at ?? this.now() + this.options.leaseMs };
@@ -1094,7 +1096,12 @@ export async function openStore(options: StoreOptions): Promise<Store> {
     : (await import("./connection.js")).connectDatabase(options.databasePath!);
   const store = new SQLiteStore(options, connection);
   try {
-    await store.connection.migrate();
+    // Route migration through the transaction wrapper, not connection.migrate() directly.
+    // On the Node backend migrate() runs raw DDL, so calling it here would apply the schema
+    // in autocommit with no rollback, and would skip the PRAGMA journal_mode=DELETE that
+    // inDatabaseTransaction sets before it begins. On D1 this also keeps migration behind
+    // the same gate every other operation uses.
+    await store.isolated(async () => undefined);
     return store;
   } catch (error) {
     // A failure in close() must not replace the startup error that explains the real cause.

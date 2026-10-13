@@ -112,6 +112,7 @@ describe("EdgeKvCache and Rate Limiting", () => {
       DB: d1,
       KV: kv,
       TELEGRAM_BOT_TOKEN: "123:ABC",
+      TELEGRAM_BOT_USERNAME: "asmo_test_bot",
       TELEGRAM_WEBHOOK_SECRET: "edge-webhook-secret-token",
     };
 

@@ -37,11 +37,23 @@ describe("SQL parameter translation", () => {
     expect(q4.bindings).toEqual([]);
   });
 
-  it("leaves $ inside string literals alone", () => {
-    // A price in a note used to be rewritten to a placeholder, shifting every binding.
-    const q = prepareSql("INSERT INTO notes(text) VALUES($1) -- keep $2 for later\nWHERE label <> '$9' AND path <> '$.detail.text'", ["costs $10"]);
-    expect(q.sql).toBe("INSERT INTO notes(text) VALUES(?1) -- keep $2 for later\nWHERE label <> '$9' AND path <> '$.detail.text'");
-    expect(q.bindings).toEqual(["costs $10"]);
+  // A $ inside quoted text is literal data. Rewriting it into a placeholder corrupts the
+  // statement and, because repeated $1 references dedupe to one binding, silently binds the
+  // wrong value into a quoted identifier without shifting anything visible. Assert the
+  // whole output string, not just that the trailing parameter translated.
+  it.each([
+    ["bracket identifier", "SELECT [price$1] FROM t WHERE id=$1", "SELECT [price$1] FROM t WHERE id=?1"],
+    ["single-quoted literal", "SELECT 'cost $10 total' AS x WHERE id=$1", "SELECT 'cost $10 total' AS x WHERE id=?1"],
+    ["double-quoted identifier", "SELECT \"col$2\" FROM t WHERE id=$1", "SELECT \"col$2\" FROM t WHERE id=?1"],
+    ["backtick identifier", "SELECT `c$3` FROM t WHERE id=$1", "SELECT `c$3` FROM t WHERE id=?1"],
+    ["json path", "SELECT data->>'$.detail.text' FROM t WHERE id=$1", "SELECT data->>'$.detail.text' FROM t WHERE id=?1"],
+    ["line comment", "SELECT 1 -- keep $9\nWHERE id=$1", "SELECT 1 -- keep $9\nWHERE id=?1"],
+    ["block comment", "SELECT 1 /* $8 */ WHERE id=$1", "SELECT 1 /* $8 */ WHERE id=?1"],
+    ["bracket with doubled close", "SELECT [a]]b$4] FROM t WHERE id=$1", "SELECT [a]]b$4] FROM t WHERE id=?1"],
+  ])("leaves a $ inside a %s alone", (_name, sql, expected) => {
+    const q = prepareSql(sql, ["a"]);
+    expect(q.sql).toBe(expected);
+    expect(q.bindings).toEqual(["a"]);
   });
 
   it("rejects parameters that were never supplied", () => {

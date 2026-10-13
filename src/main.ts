@@ -22,12 +22,21 @@ async function main() {
     // ASMO_D1_COMMAND runs the schema through the wrangler CLI against a remote D1 database.
     // The Worker binding form cannot be reached from Node, so the edge schema is applied by
     // `wrangler d1 execute` instead of silently being left to the first webhook.
+    //
+    // Set it to the database name plus any flags, not the whole command: the executable and
+    // the --file argument are supplied here. For example ASMO_D1_COMMAND="asmo-tag-d1 --remote".
     const d1Command = process.env.ASMO_D1_COMMAND;
     if (d1Command) {
       const { execFileSync } = await import("node:child_process");
       const [database, ...rest] = d1Command.split(/\s+/).filter(Boolean);
-      if (!database) throw new Error("ASMO_D1_COMMAND must name a D1 database, for example: wrangler d1 execute asmo-tag-d1 --remote");
-      execFileSync("npx", ["wrangler", "d1", "execute", database, ...rest.length ? rest : ["--remote"], "--file", "migrations/0001-edge-schema.sql"], { stdio: "inherit" });
+      if (!database) throw new Error("ASMO_D1_COMMAND must name a D1 database and optional flags, for example: asmo-tag-d1 --remote");
+      // Use the project-local wrangler when present, and fall back to npx. Resolving through
+      // the shell is required because execFileSync does not search PATHEXT on Windows, where
+      // the executable is npx.cmd.
+      const local = "node_modules/.bin/wrangler";
+      const command = existsSync(local) ? local : process.platform === "win32" ? "npx.cmd" : "npx";
+      const args = command === local ? ["d1", "execute", database, ...rest, "--file", "migrations/0001-edge-schema.sql"] : ["wrangler", "d1", "execute", database, ...rest, "--file", "migrations/0001-edge-schema.sql"];
+      execFileSync(command, args, { stdio: "inherit" });
       console.log("Asmo D1 migration passed."); return;
     }
     const path = process.env.ASMO_DATABASE_PATH;

@@ -56,12 +56,15 @@ export function createMockD1(db: DatabaseSync): D1Database {
     async dump() { return new ArrayBuffer(0); },
     async batch<T>(statements: D1PreparedStatement[]) {
       db.exec("BEGIN");
+      // Each statement is started inside the transaction. The mock's all() has no internal
+      // await, so calling it executes synchronously; collecting afterwards avoids the
+      // interleaving that an await between statements would allow, where an unrelated query
+      // could run inside this transaction and be committed or rolled back with it.
+      const started = statements.map(statement => statement.all<T>());
       try {
+        const settled = await Promise.all(started);
         const results: { success: boolean; results?: T[] }[] = [];
-        for (const statement of statements) {
-          const res = await statement.all<T>();
-          results.push({ success: true, results: res.results });
-        }
+        for (const res of settled) results.push({ success: true, results: res.results });
         db.exec("COMMIT");
         return results;
       } catch (error) {
@@ -70,14 +73,18 @@ export function createMockD1(db: DatabaseSync): D1Database {
       }
     },
     // D1 executes "one or multiple queries separated by \n" and stops at the first error,
-    // so a later statement never runs after an earlier one fails.
+    // so a later statement never runs after an earlier one fails. Every statement on the
+    // line is checked, not only the first, so `PRAGMA table_info(x); PRAGMA user_version=7`
+    // is rejected the way the real binding rejects it.
     async exec(query: string) {
       let count = 0;
       for (const line of query.split("\n")) {
         const sql = line.trim();
         if (!sql) continue;
-        const pragma = pragmaName.exec(sql);
-        if (pragma && !allowedPragmas.has(pragma[1]?.toLowerCase() ?? "")) throw new Error("not authorized: SQLITE_AUTH");
+        for (const statement of sql.split(";").map(part => part.trim()).filter(Boolean)) {
+          const pragma = pragmaName.exec(statement);
+          if (pragma && !allowedPragmas.has(pragma[1]?.toLowerCase() ?? "")) throw new Error("not authorized: SQLITE_AUTH");
+        }
         db.exec(sql);
         count += 1;
       }

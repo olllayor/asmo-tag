@@ -13,7 +13,6 @@
     "dev": "tsx src/main.ts serve",
     "demo": "tsx src/main.ts demo",
     "db:migrate": "tsx src/main.ts migrate",
-    "db:migrate:edge": "tsx src/main.ts migrate",
     "db:sync-migration": "tsx scripts/sync-edge-migration.ts",
     "db:local": "tsx scripts/local-db.ts",
     "db:stop": "tsx scripts/local-db.ts stop",

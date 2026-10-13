@@ -102,4 +102,4 @@ CREATE TABLE IF NOT EXISTS dispatches (
  workspace_id TEXT NOT NULL, scope_id TEXT NOT NULL, task_id TEXT NOT NULL, effect_id TEXT NOT NULL, token TEXT NOT NULL,
  PRIMARY KEY(workspace_id,token), FOREIGN KEY(workspace_id,scope_id,task_id,effect_id) REFERENCES effects(workspace_id,scope_id,task_id,id)
 );
-INSERT INTO asmo_schema_meta(name,version) VALUES('schema',1) ON CONFLICT(name) DO UPDATE SET version=1;
+INSERT INTO asmo_schema_meta(name,version) VALUES('schema',1) ON CONFLICT(name) DO UPDATE SET version=MAX(asmo_schema_meta.version,excluded.version);

@@ -25,6 +25,7 @@ describe("Edge Telegram Webhook Gateway", () => {
     const env: EdgeEnv = {
       DB: d1,
       TELEGRAM_BOT_TOKEN: "123456:ABC-DEF",
+      TELEGRAM_BOT_USERNAME: "asmo_test_bot",
       TELEGRAM_WEBHOOK_SECRET: "test-webhook-secret-token",
     };
 
@@ -43,6 +44,7 @@ describe("Edge Telegram Webhook Gateway", () => {
     const env: EdgeEnv = {
       DB: d1,
       TELEGRAM_BOT_TOKEN: "123456:ABC-DEF",
+      TELEGRAM_BOT_USERNAME: "asmo_test_bot",
       TELEGRAM_WEBHOOK_SECRET: "correct-webhook-secret-token",
     };
 
@@ -65,6 +67,7 @@ describe("Edge Telegram Webhook Gateway", () => {
     const env: EdgeEnv = {
       DB: d1,
       TELEGRAM_BOT_TOKEN: "123456:ABC-DEF",
+      TELEGRAM_BOT_USERNAME: "asmo_test_bot",
       TELEGRAM_WEBHOOK_SECRET: "correct-webhook-secret-token",
     };
 
@@ -209,6 +212,12 @@ describe("Edge Telegram Webhook Gateway", () => {
       },
     };
 
+    // acknowledgeCallback posts to api.telegram.org. Stub it so the suite never depends on
+    // external network access, and so the acknowledgement is awaited rather than left
+    // dangling after the test ends.
+    const fetchMock = vi.fn(async () => new Response("{}", { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
     const req = new Request("https://edge.asmo.local/telegram/webhook", {
       method: "POST",
       headers: {
@@ -222,17 +231,36 @@ describe("Edge Telegram Webhook Gateway", () => {
     expect(res.status).toBe(200);
     // ctx.waitUntil was called to acknowledge the callback query
     expect(waitUntilPromises.length).toBe(1);
+    await waitUntilPromises[0];
+    expect(fetchMock).toHaveBeenCalledOnce();
 
+    vi.unstubAllGlobals();
     rawDb.close();
   });
 });
 
 describe("Edge store lifecycle and configuration", () => {
+  it("rejects a missing bot username, which would silently break group mentions", async () => {
+    const rawDb = new DatabaseSync(":memory:");
+    const d1 = createMockD1(rawDb);
+    const env = { DB: d1, TELEGRAM_BOT_TOKEN: "123456:ABC", TELEGRAM_WEBHOOK_SECRET: "edge-webhook-secret-token" } as EdgeEnv;
+    const req = new Request("https://edge.asmo.local/telegram/webhook", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-telegram-bot-api-secret-token": "edge-webhook-secret-token" },
+      body: JSON.stringify({ update_id: 11, message: { message_id: 1, chat: { id: Number("-100999888"), type: "supergroup" }, from: { id: 42, is_bot: false }, text: "@asmo_test_bot hello", entities: [{ type: "mention", offset: 0, length: 14 }] } }),
+    });
+    const res = await handleWebhookRequest(req, env);
+    expect(res.status).toBe(500);
+    await expect(res.json()).resolves.toMatchObject({ error: expect.stringContaining("TELEGRAM_BOT_USERNAME") });
+    rawDb.close();
+  });
+
   it("answers 400 for an update payload that fails schema validation", async () => {
     const rawDb = new DatabaseSync(":memory:");
     const env: EdgeEnv = {
       DB: createMockD1(rawDb),
       TELEGRAM_BOT_TOKEN: "123456:ABC-DEF",
+      TELEGRAM_BOT_USERNAME: "asmo_test_bot",
       TELEGRAM_WEBHOOK_SECRET: "test-webhook-secret-token",
     };
     const req = new Request("https://edge.asmo.local/telegram/webhook", {
@@ -249,7 +277,8 @@ describe("Edge store lifecycle and configuration", () => {
   it("rejects non-integer configuration instead of letting NaN reach the store", async () => {
     const rawDb = new DatabaseSync(":memory:");
     const d1 = createMockD1(rawDb);
-    const env: EdgeEnv = { DB: d1, TELEGRAM_BOT_TOKEN: "123456:ABC", TELEGRAM_WEBHOOK_SECRET: "edge-webhook-secret-token", LEASE_MS: "abc" };
+    const env: EdgeEnv = { DB: d1, TELEGRAM_BOT_TOKEN: "123456:ABC",
+      TELEGRAM_BOT_USERNAME: "asmo_test_bot", TELEGRAM_WEBHOOK_SECRET: "edge-webhook-secret-token", LEASE_MS: "abc" };
     const req = new Request("https://edge.asmo.local/telegram/webhook", {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-telegram-bot-api-secret-token": "edge-webhook-secret-token" },
@@ -262,7 +291,8 @@ describe("Edge store lifecycle and configuration", () => {
   it("retries after a failed store start instead of replaying the failure", async () => {
     const rawDb = new DatabaseSync(":memory:");
     const d1 = createMockD1(rawDb);
-    const env: EdgeEnv = { DB: d1, TELEGRAM_BOT_TOKEN: "123456:ABC", TELEGRAM_WEBHOOK_SECRET: "edge-webhook-secret-token" };
+    const env: EdgeEnv = { DB: d1, TELEGRAM_BOT_TOKEN: "123456:ABC",
+      TELEGRAM_BOT_USERNAME: "asmo_test_bot", TELEGRAM_WEBHOOK_SECRET: "edge-webhook-secret-token" };
 
     const broken: D1Database = {
       ...d1,

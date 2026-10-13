@@ -28,12 +28,16 @@ const namedParameter = /\$([a-zA-Z0-9_]+)/y;
 // the statement and skips string literals, quoted identifiers, and comments, so a `$` that
 // belongs to data (a price, a JSON path) is never rewritten. An unknown or out-of-range
 // parameter throws instead of binding null into the wrong column.
+// SQLite quotes identifiers with ", `, and [ ], and escapes any of them by doubling. The
+// scanner must treat [ ] as a quoting form too, or a bracket-quoted identifier containing a
+// $ (a column named price$1) is rewritten into a placeholder and shifts every later binding.
+// [ ] is asymmetric, so its closing delimiter is not the same character.
 function endOfQuoted(sql: string, start: number): number {
-  const quote = sql[start];
+  const closing = sql[start] === "[" ? "]" : sql[start];
   let cursor = start + 1;
   while (cursor < sql.length) {
-    if (sql[cursor] === quote) {
-      if (sql[cursor + 1] === quote) { cursor += 2; continue; }
+    if (sql[cursor] === closing) {
+      if (sql[cursor + 1] === closing) { cursor += 2; continue; }
       return cursor + 1;
     }
     cursor += 1;
@@ -55,7 +59,7 @@ export function prepareSql(sql: string, parameters: unknown[] = [], workspaceId?
   let cursor = 0;
   while (cursor < sql.length) {
     const char = sql[cursor];
-    if (char === "'" || char === '"' || char === "`") {
+    if (char === "'" || char === '"' || char === "`" || char === "[") {
       const end = endOfQuoted(sql, cursor);
       translated += sql.slice(cursor, end);
       cursor = end;

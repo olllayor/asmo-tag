@@ -13,6 +13,10 @@ export class EdgeKvCache {
   // second per key, so concurrent requests can both read the same value and both write
   // count + 1. It bounds sustained abuse; it does not enforce a hard cap, and a hard cap
   // is not available on KV. A KV outage returns allowed so the bot stays up.
+  //
+  // The limit must stay well under what one KV key can absorb in the window. At 600 per
+  // minute a single chat can outrun the write rate, so the counter saturates and the limit
+  // stops binding long before it is reached.
   async checkRateLimit(
     key: string,
     limit: number,

@@ -116,6 +116,7 @@ describe("Background Edge Executor and Queue Processing", () => {
     const env: EdgeEnv = {
       DB: d1,
       TELEGRAM_BOT_TOKEN: "777:ABC",
+      TELEGRAM_BOT_USERNAME: "asmo_test_bot",
       TELEGRAM_WEBHOOK_SECRET: "edge-webhook-secret-token",
       SIMULATED: true,
     };
@@ -158,6 +159,7 @@ describe("Background Edge Executor and Queue Processing", () => {
     const env: EdgeEnv = {
       DB: d1,
       TELEGRAM_BOT_TOKEN: "777:ABC",
+      TELEGRAM_BOT_USERNAME: "asmo_test_bot",
       TELEGRAM_WEBHOOK_SECRET: "edge-webhook-secret-token",
       SIMULATED: true,
     };
@@ -280,21 +282,24 @@ describe("Background Edge Executor and Queue Processing", () => {
 
 describe("Edge simulation reporting", () => {
   it("reports simulated when model credentials are absent", () => {
-    const env = { DB: {} as never, TELEGRAM_BOT_TOKEN: "123:a", TELEGRAM_WEBHOOK_SECRET: "edge-webhook-secret-token", GITHUB_TOKEN: "gh", ALLOWED_REPOSITORIES: "a/b" } as EdgeEnv;
+    const env = { DB: {} as never, TELEGRAM_BOT_TOKEN: "123:a",
+      TELEGRAM_BOT_USERNAME: "asmo_test_bot", TELEGRAM_WEBHOOK_SECRET: "edge-webhook-secret-token", GITHUB_TOKEN: "gh", ALLOWED_REPOSITORIES: "a/b" } as EdgeEnv;
     // The dangerous deploy: no model credentials, so every task is answered by a fixture
     // while the ledger would otherwise claim real usage.
     expect(edgeSimulationGaps(env)).toEqual(["model"]);
   });
 
   it("reports no gaps when every credential is present", () => {
-    const env = { DB: {} as never, TELEGRAM_BOT_TOKEN: "123:a", TELEGRAM_WEBHOOK_SECRET: "edge-webhook-secret-token", MODEL_API_KEY: "k", MODEL_NAME: "m", GITHUB_TOKEN: "gh", ALLOWED_REPOSITORIES: "a/b" } as EdgeEnv;
+    const env = { DB: {} as never, TELEGRAM_BOT_TOKEN: "123:a",
+      TELEGRAM_BOT_USERNAME: "asmo_test_bot", TELEGRAM_WEBHOOK_SECRET: "edge-webhook-secret-token", MODEL_API_KEY: "k", MODEL_NAME: "m", GITHUB_TOKEN: "gh", ALLOWED_REPOSITORIES: "a/b" } as EdgeEnv;
     expect(edgeSimulationGaps(env)).toEqual([]);
   });
 
   it("records simulated in the usage ledger when a fixture is in use", async () => {
     const rawDb = new DatabaseSync(":memory:");
     const d1 = createMockD1(rawDb);
-    const env: EdgeEnv = { DB: d1, TELEGRAM_BOT_TOKEN: "123:a", TELEGRAM_WEBHOOK_SECRET: "edge-webhook-secret-token", GITHUB_TOKEN: "gh", ALLOWED_REPOSITORIES: "a/b" };
+    const env: EdgeEnv = { DB: d1, TELEGRAM_BOT_TOKEN: "123:a",
+      TELEGRAM_BOT_USERNAME: "asmo_test_bot", TELEGRAM_WEBHOOK_SECRET: "edge-webhook-secret-token", GITHUB_TOKEN: "gh", ALLOWED_REPOSITORIES: "a/b" };
     const { store } = await createEdgeWorker(env);
     const workspaceId = randomUUID();
     const scopeId = randomUUID();
