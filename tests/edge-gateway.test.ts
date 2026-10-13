@@ -319,3 +319,24 @@ describe("Edge store lifecycle and configuration", () => {
     rawDb.close();
   });
 });
+
+describe("Edge budget reserve floor", () => {
+  it("rejects a live deploy whose reserve cannot fund one worst-case request", async () => {
+    const rawDb = new DatabaseSync(":memory:");
+    const env: EdgeEnv = { DB: createMockD1(rawDb), TELEGRAM_BOT_TOKEN: "123456:ABC",
+      TELEGRAM_BOT_USERNAME: "asmo_test_bot", TELEGRAM_WEBHOOK_SECRET: "edge-webhook-secret-token",
+      MODEL_API_KEY: "k", MODEL_NAME: "m", MODEL_RESERVE_MICROS: "1000" };
+    await expect(getEdgeStore(env)).rejects.toThrow("MODEL_RESERVE_MICROS must be at least");
+    rawDb.close();
+  });
+
+  it("accepts the aligned reserve default for a live model", async () => {
+    const rawDb = new DatabaseSync(":memory:");
+    const env: EdgeEnv = { DB: createMockD1(rawDb), TELEGRAM_BOT_TOKEN: "123456:ABC",
+      TELEGRAM_BOT_USERNAME: "asmo_test_bot", TELEGRAM_WEBHOOK_SECRET: "edge-webhook-secret-token",
+      MODEL_API_KEY: "k", MODEL_NAME: "m" };
+    const store = await getEdgeStore(env);
+    await store.close();
+    rawDb.close();
+  });
+});

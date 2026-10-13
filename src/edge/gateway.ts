@@ -8,6 +8,7 @@ import {
   edgeSimulationGaps,
   handleQueueBatch,
   handleScheduled,
+  resolveEdgeModelPrices,
 } from "./executor.js";
 import { EdgeKvCache } from "./kv.js";
 import type { R2Bucket } from "./r2.js";
@@ -46,6 +47,9 @@ export interface EdgeEnv {
   MODEL_PROVIDER?: "openai" | "deepseek" | "glm";
   MODEL_ENDPOINT?: string;
   MODEL_NAME?: string;
+  MODEL_INPUT_USD_PER_MILLION?: string | number;
+  MODEL_CACHED_INPUT_USD_PER_MILLION?: string | number;
+  MODEL_OUTPUT_USD_PER_MILLION?: string | number;
   GITHUB_TOKEN?: string;
   ALLOWED_REPOSITORIES?: string;
 }
@@ -83,12 +87,25 @@ export function getEdgeStore(env: EdgeEnv): Promise<Store> {
   if (!env.DB) return Promise.reject(new Error("Missing configuration: DB binding"));
   const cached = storeCache.get(env.DB);
   if (cached) return cached;
+  const modelReserveMicros = envInteger(env, "MODEL_RESERVE_MICROS", 100_000);
+  const maxOutputTokens = envInteger(env, "MAX_OUTPUT_TOKENS", 2000);
+  const taskBudgetMicros = envInteger(env, "TASK_BUDGET_MICROS", 2_000_000);
+  // Mirror the Node reserve floor (src/config.ts): a reserve below one worst-case
+  // request lets concurrent tasks each fund the same remaining allowance. Skip the
+  // check while simulated, where the ledger labels usage as unbilled.
+  if (!edgeSimulationGaps(env).includes("model")) {
+    const prices = resolveEdgeModelPrices(env);
+    const upperBound = Math.ceil(100_000 * Math.max(prices.inputUsdPerMillion, prices.cachedInputUsdPerMillion) + maxOutputTokens * prices.outputUsdPerMillion);
+    if (modelReserveMicros < upperBound) {
+      return Promise.reject(new Error(`Configuration error: MODEL_RESERVE_MICROS must be at least ${upperBound} for the configured request bounds and prices.`));
+    }
+  }
   const pending = openStore({
     d1: env.DB,
-    modelReserveMicros: envInteger(env, "MODEL_RESERVE_MICROS", 1000),
-    maxOutputTokens: envInteger(env, "MAX_OUTPUT_TOKENS", 2000),
+    modelReserveMicros,
+    maxOutputTokens,
     maxTurns: envInteger(env, "MAX_TURNS", 12),
-    taskBudgetMicros: envInteger(env, "TASK_BUDGET_MICROS", 20_000),
+    taskBudgetMicros,
     leaseMs: envInteger(env, "LEASE_MS", 10_000),
     simulated: envBoolean(env, "SIMULATED", false) || edgeSimulationGaps(env).length > 0,
   });

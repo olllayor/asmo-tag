@@ -77,19 +77,38 @@ describe("EdgeArtifactStore (Cloudflare R2)", () => {
     await store.deleteArtifact("artifacts/task-123.log");
     expect(await store.getArtifact("artifacts/task-123.log")).toBeNull();
   });
+
+  it("fails closed when no R2 binding is configured", async () => {
+    const store = new EdgeArtifactStore();
+    expect(store.configured).toBe(false);
+    // A missing binding must throw, not return a digest for bytes stored nowhere.
+    await expect(store.putArtifact("artifacts/task-123.log", "content")).rejects.toThrow("not configured");
+    expect(await store.getArtifact("artifacts/task-123.log")).toBeNull();
+  });
 });
 
 describe("Ephemeral Sandbox Connector", () => {
-  it("executes commands in InMemorySandboxConnector", async () => {
+  it("fails closed when no sandbox endpoint is configured", async () => {
     const connector = new InMemorySandboxConnector();
-    const result = await connector.execute({
+    // An unconfigured sandbox must never report a successful run for work it did
+    // not execute. Callers record the result, so exitCode 0 here would fake success.
+    await expect(connector.execute({
       command: "python3 test.py",
       files: { "test.py": "print('hello from sandbox')" },
-    });
+    })).rejects.toThrow("not configured");
+  });
+
+  it("executes through the injected handler when one is provided", async () => {
+    const connector = new InMemorySandboxConnector(() => ({
+      exitCode: 0,
+      stdout: "pytest passed: 10 tests",
+      stderr: "",
+      durationMs: 1,
+    }));
+    const result = await connector.execute({ command: "pytest tests/" });
 
     expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain("python3 test.py");
-    expect(result.durationMs).toBeGreaterThanOrEqual(0);
+    expect(result.stdout).toBe("pytest passed: 10 tests");
   });
 
   it("calls remote ephemeral sandbox API with proper auth and payload", async () => {

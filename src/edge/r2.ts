@@ -48,22 +48,27 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
 export class EdgeArtifactStore {
   constructor(private readonly r2?: R2Bucket) {}
 
+  get configured(): boolean {
+    return this.r2 !== undefined;
+  }
+
   async putArtifact(
     key: string,
     content: string | Uint8Array,
     metadata: Record<string, string> = {}
   ): Promise<{ key: string; size: number; sha256: string }> {
+    // Fail closed: without an R2 binding there is nowhere to persist, so claiming a
+    // successful save would strand callers with a digest for bytes that exist nowhere.
+    if (!this.r2) throw new Error("Artifact storage is not configured: missing R2 binding.");
     const bytes = typeof content === "string" ? new TextEncoder().encode(content) : content;
     // Pass the view itself: bytes.buffer can extend past the view (subarrays), which
     // would hash the wrong bytes.
     const sha256 = await sha256Hex(bytes);
 
-    if (this.r2) {
-      await this.r2.put(key, bytes, {
-        customMetadata: { ...metadata, sha256 },
-        sha256,
-      });
-    }
+    await this.r2.put(key, bytes, {
+      customMetadata: { ...metadata, sha256 },
+      sha256,
+    });
 
     return { key, size: bytes.byteLength, sha256 };
   }

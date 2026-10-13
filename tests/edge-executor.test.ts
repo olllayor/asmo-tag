@@ -5,7 +5,7 @@ import type { D1Database } from "../src/store/d1.js";
 import { createMockD1 } from "./helpers/mock-d1.js";
 import { openStore } from "../src/store/index.js";
 import { handleWebhookRequest } from "../src/edge/gateway.js";
-import { drainJobs, handleQueueBatch, handleScheduled, createEdgeWorker, edgeSimulationGaps } from "../src/edge/executor.js";
+import { drainJobs, handleQueueBatch, handleScheduled, createEdgeWorker, edgeSimulationGaps, createEdgeModel, createInMemoryConnector, resolveEdgeModelPrices } from "../src/edge/executor.js";
 import type {
   Message,
   MessageBatch,
@@ -48,7 +48,7 @@ describe("Background Edge Executor and Queue Processing", () => {
       modelReserveMicros: 1000,
       maxOutputTokens: 2000,
       maxTurns: 12,
-      taskBudgetMicros: 20_000,
+      taskBudgetMicros: 2_000_000,
       leaseMs: 10_000,
       simulated: true,
     });
@@ -197,7 +197,7 @@ describe("Background Edge Executor and Queue Processing", () => {
       modelReserveMicros: 1000,
       maxOutputTokens: 2000,
       maxTurns: 12,
-      taskBudgetMicros: 20_000,
+      taskBudgetMicros: 2_000_000,
       leaseMs: 10_000,
       simulated: true,
     });
@@ -317,5 +317,44 @@ describe("Edge simulation reporting", () => {
     expect(view.usage.simulated).toBe(true);
     await store.close();
     rawDb.close();
+  });
+});
+
+describe("Edge fail-closed simulation contracts", () => {
+  it("never records a simulated issue under a github.com URL", async () => {
+    const connector = createInMemoryConnector();
+    const receipt = await connector.invoke({
+      call: { name: "github_create_issue", input: { repository: "a/b", title: "t", body: "b" } },
+    } as any, new AbortController().signal);
+    expect(receipt.url).not.toContain("github.com");
+    expect(receipt.url).toContain("asmo-simulated.invalid");
+    expect(receipt.providerId).toContain("simulated-");
+    expect(receipt.content).toContain("No GitHub issue exists");
+  });
+
+  it("rejects a DeepSeek model without explicit prices", () => {
+    const env = { DB: {} as never, TELEGRAM_BOT_TOKEN: "123:a",
+      TELEGRAM_BOT_USERNAME: "asmo_test_bot", TELEGRAM_WEBHOOK_SECRET: "edge-webhook-secret-token",
+      MODEL_API_KEY: "k", MODEL_NAME: "m", MODEL_PROVIDER: "deepseek" } as EdgeEnv;
+    // OpenAI rates must never silently price DeepSeek usage in the ledger.
+    expect(() => resolveEdgeModelPrices(env)).toThrow("not defaulted");
+    expect(() => createEdgeModel(env)).toThrow("not defaulted");
+  });
+
+  it("accepts explicit prices for either provider", () => {
+    const base = { DB: {} as never, TELEGRAM_BOT_TOKEN: "123:a",
+      TELEGRAM_BOT_USERNAME: "asmo_test_bot", TELEGRAM_WEBHOOK_SECRET: "edge-webhook-secret-token",
+      MODEL_API_KEY: "k", MODEL_NAME: "m",
+      MODEL_INPUT_USD_PER_MILLION: "1", MODEL_CACHED_INPUT_USD_PER_MILLION: "0.5", MODEL_OUTPUT_USD_PER_MILLION: "2" } as EdgeEnv;
+    expect(resolveEdgeModelPrices(base)).toEqual({ inputUsdPerMillion: 1, cachedInputUsdPerMillion: 0.5, outputUsdPerMillion: 2 });
+    expect(createEdgeModel(base).simulated).toBe(false);
+    expect(createEdgeModel({ ...base, MODEL_PROVIDER: "deepseek" }).simulated).toBe(false);
+  });
+
+  it("rejects a partial price override instead of mixing it with defaults", () => {
+    const env = { DB: {} as never, TELEGRAM_BOT_TOKEN: "123:a",
+      TELEGRAM_BOT_USERNAME: "asmo_test_bot", TELEGRAM_WEBHOOK_SECRET: "edge-webhook-secret-token",
+      MODEL_API_KEY: "k", MODEL_NAME: "m", MODEL_INPUT_USD_PER_MILLION: "1" } as EdgeEnv;
+    expect(() => resolveEdgeModelPrices(env)).toThrow("together");
   });
 });

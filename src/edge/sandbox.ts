@@ -78,12 +78,9 @@ export class InMemorySandboxConnector implements SandboxConnector {
     if (this.mockHandler) {
       return this.mockHandler(options);
     }
-    return {
-      exitCode: 0,
-      stdout: `Simulated execution of: ${options.command}`,
-      stderr: "",
-      durationMs: 5,
-    };
+    // Fail closed: without a remote endpoint this connector cannot execute anything.
+    // Returning exitCode 0 here would record unexecuted work as a successful run.
+    throw new Error("Sandbox execution is not configured. Set SANDBOX_ENDPOINT and SANDBOX_API_KEY for live execution.");
   }
 }
 

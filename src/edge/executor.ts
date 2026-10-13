@@ -11,10 +11,12 @@ export function createInMemoryConnector(): IssueConnector {
       signal?.throwIfAborted();
       const id = Math.floor(Math.random() * 100_000) + 1;
       const repo = "repository" in effect.call.input ? (effect.call.input as any).repository : "default/repo";
+      // Fail honest: the URL must never look like a real GitHub issue. Callers record
+      // this receipt, so a github.com URL here would present an uncreated issue as live.
       return {
-        providerId: String(id),
-        url: "https://github.com/" + repo + "/issues/" + id,
-        content: JSON.stringify({ simulated: true, repository: repo, number: id }),
+        providerId: `simulated-issue-${id}`,
+        url: `https://asmo-simulated.invalid/issues/${id}`,
+        content: JSON.stringify({ simulated: true, repository: repo, number: id, limitation: "Simulated issue recorded in memory only. No GitHub issue exists." }),
       };
     },
     async reconcile(effect, signal) {
@@ -153,16 +155,58 @@ export function createEdgeModel(env: EdgeEnv): ModelProvider {
       throw new Error(`Configuration error: MODEL_PROVIDER must be openai or deepseek`);
     }
     const provider = (env.MODEL_PROVIDER === "deepseek" ? "deepseek" : "openai") as "openai" | "deepseek";
+    const prices = resolveEdgeModelPrices(env);
     return createResponsesModel({
       provider,
       apiKey: env.MODEL_API_KEY,
       model: env.MODEL_NAME,
-      inputUsdPerMillion: 0.15,
-      cachedInputUsdPerMillion: 0.075,
-      outputUsdPerMillion: 0.60,
+      inputUsdPerMillion: prices.inputUsdPerMillion,
+      cachedInputUsdPerMillion: prices.cachedInputUsdPerMillion,
+      outputUsdPerMillion: prices.outputUsdPerMillion,
     });
   }
   return createFixtureModel();
+}
+
+export interface EdgeModelPrices {
+  inputUsdPerMillion: number;
+  cachedInputUsdPerMillion: number;
+  outputUsdPerMillion: number;
+}
+
+// Hardcoded prices cover the OpenAI profile only. DeepSeek bills on its own schedule,
+// so applying OpenAI rates to it would misstate spend in the usage ledger. A DeepSeek
+// deploy must set explicit MODEL_*_USD_PER_MILLION values and fails loudly without them.
+const OPENAI_DEFAULT_PRICES: EdgeModelPrices = {
+  inputUsdPerMillion: 0.15,
+  cachedInputUsdPerMillion: 0.075,
+  outputUsdPerMillion: 0.60,
+};
+
+function edgePrice(env: EdgeEnv, key: "MODEL_INPUT_USD_PER_MILLION" | "MODEL_CACHED_INPUT_USD_PER_MILLION" | "MODEL_OUTPUT_USD_PER_MILLION"): number | null {
+  const raw = env[key];
+  if (raw === undefined || raw === null || raw === "") return null;
+  const value = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(value) || value < 0) {
+    throw new Error(`Configuration error: ${key} must be a finite nonnegative USD price per million tokens.`);
+  }
+  return value;
+}
+
+export function resolveEdgeModelPrices(env: EdgeEnv): EdgeModelPrices {
+  const input = edgePrice(env, "MODEL_INPUT_USD_PER_MILLION");
+  const cached = edgePrice(env, "MODEL_CACHED_INPUT_USD_PER_MILLION");
+  const output = edgePrice(env, "MODEL_OUTPUT_USD_PER_MILLION");
+  if (input !== null && cached !== null && output !== null) {
+    return { inputUsdPerMillion: input, cachedInputUsdPerMillion: cached, outputUsdPerMillion: output };
+  }
+  if (env.MODEL_PROVIDER === "deepseek") {
+    throw new Error("Configuration error: DeepSeek prices are not defaulted. Set MODEL_INPUT_USD_PER_MILLION, MODEL_CACHED_INPUT_USD_PER_MILLION, and MODEL_OUTPUT_USD_PER_MILLION.");
+  }
+  if (input !== null || cached !== null || output !== null) {
+    throw new Error("Configuration error: set all of MODEL_INPUT_USD_PER_MILLION, MODEL_CACHED_INPUT_USD_PER_MILLION, and MODEL_OUTPUT_USD_PER_MILLION together, or none for OpenAI defaults.");
+  }
+  return OPENAI_DEFAULT_PRICES;
 }
 
 export function createEdgeConnector(env: EdgeEnv): IssueConnector {
