@@ -73,6 +73,11 @@ const manager = (role: string | null) => role === "owner" || role === "manager";
 const pendingJobLimitPerWorkspace = 500;
 const modelLeaseLimitPerScope = 2;
 const deferredClaimMs = 250;
+// A held job is released in bounded batches with exponential backoff, and never more often
+// than this. Without a floor a workspace whose scope is permanently inactive would re-hold
+// the same jobs on every sweep.
+const heldReleaseBatchSize = 20;
+const heldReleaseBackoffMs = [1_000, 5_000, 30_000, 120_000];
 const scopeSourceWindowLimit = 300;
 
 async function rows<T>(db: Db, sql: string, parameters: unknown[], schema: z.ZodType<T>): Promise<T[]> {
@@ -730,7 +735,23 @@ class SQLiteStore implements Store {
       if (!unresolved.length && !model.length) { const paused: Task = { ...task, state: "paused", reason: null }; await save(db, "tasks", paused); await event(db, scope, task.id, null, "stop_settled", {}, this.now()); await notice(db, scope, paused, "I’ve stopped. Completed actions are retained.", this.now()); }
     }
   }
+  // L20: a job set to held stays held forever. Every hold reason is transient in the sense
+  // that claim() re-validates it on every attempt (scope active, requester allowed, tool
+  // results complete, budget available), so promoting a held job back to ready is safe: if
+  // the condition still holds, claim() simply re-holds it and the attempt counter grows.
+  // Without this sweep a temporary denial (a scope paused for an afternoon, a workspace that
+  // hit the pending-job cap, an unknown effect awaiting reconciliation) permanently strands
+  // the job, and the user is never told.
+  async releaseHeldJobs(): Promise<void> {
+    const candidates = await this.connection.discover("SELECT workspace_id,id,attempts FROM jobs WHERE ($2 IS NULL OR workspace_id IN (SELECT value FROM json_each($2))) AND state='held' ORDER BY attempts,ready_at LIMIT $3", [this.now(), this.options.workspaceIds ?? null, heldReleaseBatchSize], z.object({ workspace_id: z.string(), id: z.string(), attempts: z.number() }));
+    for (const candidate of candidates) {
+      const backoff = heldReleaseBackoffMs[Math.min(candidate.attempts, heldReleaseBackoffMs.length - 1)] ?? 0;
+      // ready_at carries the next eligible instant, so the backoff needs no extra column.
+      await this.connection.query("UPDATE jobs SET state='ready',ready_at=$3,token=NULL,worker_id=NULL,expires_at=NULL WHERE workspace_id=$workspace AND id=$1 AND state='held'", [candidate.id, this.now(), this.now() + backoff], candidate.workspace_id);
+    }
+  }
   async materializeRoutines(): Promise<void> {
+    await this.releaseHeldJobs();
     const result = await this.connection.discover("SELECT workspace_id,scope_id,id FROM routines WHERE ($2 IS NULL OR workspace_id IN (SELECT value FROM json_each($2))) AND data->>'state'='active' AND data->>'nextAt'<=$1 LIMIT 20", [this.now(), this.options.workspaceIds ?? null], locationSchema.extend({ id: z.string() }));
     for (const location of result) {
       await this.scopeTransaction(location.scope_id, async (db, scope) => {

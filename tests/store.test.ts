@@ -728,8 +728,11 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     }
     expect(released).toBeGreaterThan(0);
     expect(released).toBeLessThanOrEqual(500);
+    // Held jobs self-heal: releaseHeldJobs promotes them back to ready with a future
+    // ready_at carrying the backoff. So the invariant is that nothing is claimable, not that
+    // nothing sits in ready.
     const db = new DatabaseSync(options.databasePath);
-    try { expect(db.prepare("SELECT count(*) AS count FROM jobs WHERE state IN ('ready','leased')").get()?.count).toBe(0); }
+    try { expect(db.prepare("SELECT count(*) AS count FROM jobs WHERE state='leased' OR (state='ready' AND ready_at<=?)").get(now)?.count).toBe(0); }
     finally { db.close(); }
     expect((await command({ kind: "resume", taskId })).kind).toBe("accepted");
     const resumed = await claimModel();
@@ -1067,4 +1070,45 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     } finally { db.close(); }
   });
 
+});
+
+describe("Held job release (L20)", () => {
+  it("promotes a held job back to ready with backoff once its condition clears", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "asmo-held-"));
+    const options: StoreOptions & { databasePath: string } = {
+      databasePath: join(directory, "held.sqlite"),
+      modelReserveMicros: 1000, maxOutputTokens: 2000, maxTurns: 12, taskBudgetMicros: 20_000, leaseMs: 10_000, simulated: true, clock: () => Date.now(),
+    };
+    const store = await openStore(options);
+    const workspaceId = randomUUID();
+    const scopeId = randomUUID();
+    await store.seed({
+      botId: randomUUID(), workspaceId, name: "Held", ownerId: "owner", budgetMicros: 200_000,
+      scopes: [{ id: scopeId, workspaceId, kind: "group", chatId: "-1007", ownerId: null, name: "Held", active: true, workspacePublic: false, timezone: "UTC", policyRevision: 1, collectedSince: Date.now(), budgetMicros: 100_000 }],
+      memberships: [{ scopeId, userId: "member", role: "member" }], grants: [],
+    });
+    await store.command({ scopeId, userId: "member", key: "k1", command: { kind: "start", instruction: "held work", topicId: null } });
+    // Park the job the way any hold site does, then prove the sweep is what moves it back.
+    // Creating the hold through a real hold path would couple this test to why a job was
+    // held, when what L20 needs covered is that a held job is never stranded.
+    const db = new DatabaseSync(options.databasePath);
+    try {
+      db.exec("UPDATE jobs SET state='held',ready_at=1");
+      const heldBefore = db.prepare("SELECT count(*) AS count FROM jobs WHERE state='held'").get()?.count ?? 0;
+      expect(heldBefore).toBeGreaterThan(0);
+      await store.materializeRoutines();
+      // Every held job is promoted; none is left stranded.
+      expect(db.prepare("SELECT count(*) AS count FROM jobs WHERE state='held'").get()?.count).toBe(0);
+      expect(db.prepare("SELECT count(*) AS count FROM jobs WHERE state='ready'").get()?.count).toBe(heldBefore);
+      // The backoff rides on ready_at, so the jobs are ready but not claimable yet.
+      const soonest = db.prepare("SELECT MIN(ready_at) AS at FROM jobs WHERE state='ready'").get() as { at: number };
+      expect(soonest.at).toBeGreaterThan(Date.now() - 1);
+      // A second sweep must not duplicate the job or reset the backoff.
+      const jobsBefore = db.prepare("SELECT count(*) AS count FROM jobs").get()?.count;
+      await store.materializeRoutines();
+      expect(db.prepare("SELECT count(*) AS count FROM jobs").get()?.count).toBe(jobsBefore);
+    } finally { db.close(); }
+    await store.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
 });
