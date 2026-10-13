@@ -13,29 +13,44 @@ import { enrichFixture, fixtureScope, startFixtureTask } from "./fixture.js";
 
 if (existsSync(".env")) loadEnvFile(".env");
 const action = process.argv[2] ?? "help";
+
+// The flags for `wrangler d1 execute`. Remote is the contract this path exists for, so a
+// bare database name must not silently migrate the local development database instead.
+// Explicit flags still win, which keeps `--local` usable as an opt-out.
+export function d1ExecuteFlags(rest: string[]): string[] {
+  return rest.length > 0 ? rest : ["--remote"];
+}
+
 async function main() {
   if (action === "help") {
     console.log("Asmo Tag\nCommands: migrate, bootstrap <seed.json>, demo, serve, worker-once\nSet ASMO_MODE explicitly to fixture or live. Fixture mode is simulated.");
     return;
   }
+
   if (action === "migrate") {
     // ASMO_D1_COMMAND runs the schema through the wrangler CLI against a remote D1 database.
     // The Worker binding form cannot be reached from Node, so the edge schema is applied by
     // `wrangler d1 execute` instead of silently being left to the first webhook.
     //
-    // Set it to the database name plus any flags, not the whole command: the executable and
-    // the --file argument are supplied here. For example ASMO_D1_COMMAND="asmo-tag-d1 --remote".
+    // Set it to the database name plus any extra flags, not the whole command: the
+    // executable and the --file argument are supplied here. For example
+    // ASMO_D1_COMMAND="asmo-tag-d1", or "asmo-tag-d1 --remote" to be explicit.
     const d1Command = process.env.ASMO_D1_COMMAND;
     if (d1Command) {
       const { execFileSync } = await import("node:child_process");
       const [database, ...rest] = d1Command.split(/\s+/).filter(Boolean);
-      if (!database) throw new Error("ASMO_D1_COMMAND must name a D1 database and optional flags, for example: asmo-tag-d1 --remote");
+      if (!database) throw new Error("ASMO_D1_COMMAND must name a D1 database, for example: asmo-tag-d1");
+      // Remote is the contract this path exists for: the Worker binding cannot be reached
+      // from Node, so the schema has to be applied to the database the Worker will use.
+      // Defaulting to --remote keeps a bare database name from silently migrating the local
+      // development database instead. Explicit flags still win.
+      const flags = d1ExecuteFlags(rest);
       // Use the project-local wrangler when present, and fall back to npx. Resolving through
       // the shell is required because execFileSync does not search PATHEXT on Windows, where
       // the executable is npx.cmd.
       const local = "node_modules/.bin/wrangler";
       const command = existsSync(local) ? local : process.platform === "win32" ? "npx.cmd" : "npx";
-      const args = command === local ? ["d1", "execute", database, ...rest, "--file", "migrations/0001-edge-schema.sql"] : ["wrangler", "d1", "execute", database, ...rest, "--file", "migrations/0001-edge-schema.sql"];
+      const args = command === local ? ["d1", "execute", database, ...flags, "--file", "migrations/0001-edge-schema.sql"] : ["wrangler", "d1", "execute", database, ...flags, "--file", "migrations/0001-edge-schema.sql"];
       execFileSync(command, args, { stdio: "inherit" });
       console.log("Asmo D1 migration passed."); return;
     }
