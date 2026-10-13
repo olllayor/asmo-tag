@@ -16,7 +16,7 @@ type DeliveryJob = Extract<Job, { kind: "delivery" }>;
 
 describe("SQLite task lifecycle with simulated integrations", () => {
   let store: Store;
-  let options: StoreOptions;
+  let options: StoreOptions & { databasePath: string };
   let seed: Seed;
   let scope: Scope;
   let otherScope: Scope;

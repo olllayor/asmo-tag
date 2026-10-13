@@ -1,3 +1,4 @@
+import type { D1Database } from "./store/d1.js";
 import { z } from 'zod';
 
 export const id = z.string().min(1).max(128);
@@ -381,7 +382,8 @@ export interface Store {
   close(): Promise<void>;
 }
 export type StoreOptions = {
-  databasePath: string;
+  databasePath?: string;
+  d1?: D1Database;
   workspaceIds?: string[];
   modelReserveMicros: number;
   maxOutputTokens: number;

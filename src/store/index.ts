@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
-import { connectDatabase, inDatabaseTransaction } from "./connection.js";
-import type { Db } from "./connection.js";
+import type { Connection } from "./connection.js";
+import type { Db } from "./sql.js";
+import { connectD1Database, inD1Transaction, isD1Database } from "./d1.js";
+import type { D1Connection, D1Database } from "./d1.js";
 import { z } from "zod";
 import { conversationAnswer } from "../conversation.js";
 import {
@@ -150,23 +152,44 @@ function settledProgress(task: Task): string {
   return "I'm not working on this right now.";
 }
 
-export async function migrateDatabase(databasePath: string): Promise<void> {
-  const connection = connectDatabase(databasePath);
-  try { await inDatabaseTransaction(connection, async () => undefined); }
-  finally { connection.close(); }
+export async function migrateDatabase(target: string | D1Database): Promise<void> {
+  // The local-SQLite backend lives in ./connection.js alongside node:sqlite/node:fs
+  // imports, which must never load inside the edge worker. It is imported lazily so
+  // the D1 path (and the edge bundle) never pulls it in.
+  const connection = typeof target === "string" ? (await import("./connection.js")).connectDatabase(target) : connectD1Database(target);
+  try { await connection.migrate(); }
+  finally { await connection.close(); }
+}
+
+function assertBackend(options: StoreOptions): void {
+  if (options.databasePath && options.d1) throw new Error("Store accepts either databasePath or d1, not both");
+  if (!options.databasePath && !options.d1) throw new Error("Store requires either databasePath or d1 database");
+  if (options.d1 && !isD1Database(options.d1)) throw new Error("Store requires a Cloudflare D1 database binding for d1");
 }
 
 class SQLiteStore implements Store {
-  readonly connection;
+  readonly connection: Connection | D1Connection;
   readonly options: StoreOptions;
   readonly now: () => number;
-  constructor(options: StoreOptions) {
+  constructor(options: StoreOptions, connection: Connection | D1Connection) {
     this.options = options;
     this.now = options.clock ?? Date.now;
-    this.connection = connectDatabase(options.databasePath);
+    this.connection = connection;
+  }
+  // Dispatches to the D1 gate without touching ./connection.js (which imports
+  // node:sqlite/node:fs and must never load on the edge), and to the full
+  // BEGIN IMMEDIATE transaction on Node. The dynamic import below is only ever
+  // reached on the local-SQLite path; bundlers keep it a separate chunk.
+  async isolated<T>(operation: () => Promise<T>): Promise<T> {
+    const connection = this.connection;
+    if ("isD1" in connection && connection.isD1) {
+      return inD1Transaction(connection, operation);
+    }
+    const { inDatabaseTransaction } = await import("./connection.js");
+    return inDatabaseTransaction(connection as Connection, operation);
   }
   async transact<T>(workspaceId: string, operation: (db: Db) => Promise<T>): Promise<T> {
-    return inDatabaseTransaction(this.connection, () => operation(this.connection.context(workspaceId)));
+    return this.isolated(() => operation(this.connection.context(workspaceId)));
   }
   async locate(scopeId: string): Promise<Location> {
     return first(await this.connection.discover("SELECT workspace_id,id AS scope_id FROM scopes WHERE id=$1", [scopeId], locationSchema));
@@ -770,15 +793,18 @@ class SQLiteStore implements Store {
     if (kind !== "delivery") await this.materializeRoutines();
     for (let attempt = 0; attempt < 40; attempt += 1) {
       const token = uuid();
-      const job = await inDatabaseTransaction(this.connection, async (): Promise<Job | null | undefined> => {
+      const job = await this.isolated(async (): Promise<Job | null | undefined> => {
         const candidates = await this.connection.discover("SELECT workspace_id,scope_id,id FROM jobs WHERE ($2 IS NULL OR workspace_id IN (SELECT value FROM json_each($2))) AND ($3 IS NULL OR kind=$3) AND ((state='ready' AND ready_at<=$1) OR (state='leased' AND expires_at<=$1)) ORDER BY CASE kind WHEN 'effect' THEN 0 WHEN 'delivery' THEN 1 ELSE 2 END,ready_at LIMIT 1", [this.now(), this.options.workspaceIds ?? null, kind ?? null], locationSchema.extend({ id: z.string() }));
         const location = candidates[0];
         if (!location) return undefined;
         const db = this.connection.context(location.workspace_id);
         const scope = first(await records(db, "scopes", scopeSchema, "id=$1", [location.scope_id]));
-        await db.query("UPDATE jobs SET state='leased',token=$2,worker_id=$3,expires_at=$4,attempts=attempts+1 WHERE workspace_id=$workspace AND id=$1", [location.id, token, workerId, this.now() + this.options.leaseMs]);
-        const row = first(await rows(db, "SELECT * FROM jobs WHERE workspace_id=$workspace AND id=$1", [location.id], jobRowSchema));
-        if (row.token !== token || row.state !== "leased") return null;
+        // The state guard makes the lease a compare-and-swap. D1 has no interactive
+        // transaction to hold a write lock across statements, so without it two isolates
+        // can lease the same job and both run it.
+        const leased = await rows(db, "UPDATE jobs SET state='leased',token=$2,worker_id=$3,expires_at=$4,attempts=attempts+1 WHERE workspace_id=$workspace AND id=$1 AND (state='ready' OR (state='leased' AND expires_at<=$5)) RETURNING *", [location.id, token, workerId, this.now() + this.options.leaseMs, this.now()], jobRowSchema);
+        const row = leased[0];
+        if (!row || row.token !== token) return null;
         const lease = { id: row.id, token, workerId, expiresAt: row.expires_at ?? this.now() + this.options.leaseMs };
         const task = row.task_id ? await taskRecord(db, scope.id, row.task_id) : null;
         if (row.kind === "delivery") {
@@ -1055,14 +1081,24 @@ class SQLiteStore implements Store {
     });
   }
   async close(): Promise<void> {
-    try { await inDatabaseTransaction(this.connection, async () => undefined); }
-    finally { this.connection.close(); }
+    try { await this.isolated(async () => undefined); }
+    finally { await this.connection.close(); }
   }
 }
 
 export async function openStore(options: StoreOptions): Promise<Store> {
-  z.object({ databasePath: z.string().min(1), modelReserveMicros: z.number().int().positive().max(Number.MAX_SAFE_INTEGER), maxOutputTokens: z.number().int().positive(), maxTurns: z.number().int().positive(), taskBudgetMicros: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER), leaseMs: z.number().int().min(100).max(3_600_000), simulated: z.boolean() }).parse(options);
-  const store = new SQLiteStore(options);
-  try { await inDatabaseTransaction(store.connection, async () => undefined); return store; }
-  catch (error) { store.connection.close(); throw error; }
+  z.object({ databasePath: z.string().min(1).optional(), modelReserveMicros: z.number().int().positive().max(Number.MAX_SAFE_INTEGER), maxOutputTokens: z.number().int().positive(), maxTurns: z.number().int().positive(), taskBudgetMicros: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER), leaseMs: z.number().int().min(100).max(3_600_000), simulated: z.boolean() }).parse(options);
+  assertBackend(options);
+  const connection = options.d1
+    ? connectD1Database(options.d1)
+    : (await import("./connection.js")).connectDatabase(options.databasePath!);
+  const store = new SQLiteStore(options, connection);
+  try {
+    await store.connection.migrate();
+    return store;
+  } catch (error) {
+    // A failure in close() must not replace the startup error that explains the real cause.
+    await store.connection.close()?.catch(() => undefined);
+    throw error;
+  }
 }
