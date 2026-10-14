@@ -243,10 +243,11 @@ export async function createEdgeWorker(
 export async function drainJobs(
   env: EdgeEnv,
   limit = 20,
-  options?: EdgeWorkerOptions
+  options?: EdgeWorkerOptions,
+  workerId = "edge-drain"
 ): Promise<number> {
   const { worker } = await createEdgeWorker(env, options);
-  return worker.drain(limit);
+  return worker.drain(limit, workerId);
 }
 
 export async function handleQueueBatch(
@@ -256,24 +257,24 @@ export async function handleQueueBatch(
   options?: EdgeWorkerOptions
 ): Promise<{ processed: number; acked: number }> {
   const { worker } = await createEdgeWorker(env, options);
-  let processed = 0;
-  let acked = 0;
-
+  let totalLimit = 0;
   for (const message of batch.messages) {
-    try {
-      const msg = message.body;
-      const limit = msg.limit ?? 10;
-      const drained = await worker.drain(limit);
-      processed += drained;
+    totalLimit += message.body.limit ?? 10;
+  }
+  let processed = 0;
+  try {
+    processed = await worker.drain(Math.min(totalLimit, 50), "edge-queue");
+    for (const message of batch.messages) {
       message.ack();
-      acked += 1;
-    } catch (error) {
-      console.error("Queue job execution error:", error);
+    }
+    return { processed, acked: batch.messages.length };
+  } catch (error) {
+    console.error("Queue job execution error:", error);
+    for (const message of batch.messages) {
       message.retry();
     }
+    return { processed: 0, acked: 0 };
   }
-
-  return { processed, acked };
 }
 
 export async function handleScheduled(
@@ -284,6 +285,6 @@ export async function handleScheduled(
 ): Promise<{ processed: number }> {
   // Routine advancement is triggered automatically inside claim()
   const { worker } = await createEdgeWorker(env, options);
-  const processed = await worker.drain(50);
+  const processed = await worker.drain(20, "edge-scheduled");
   return { processed };
 }

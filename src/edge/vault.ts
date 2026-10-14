@@ -10,7 +10,9 @@ function base64ToUint8Array(base64: string): Uint8Array {
     copy.set(buf);
     return copy;
   }
-  const binary = atob(base64);
+  const normalized = base64.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = normalized.padEnd(normalized.length + (4 - (normalized.length % 4)) % 4, "=");
+  const binary = atob(padded);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) {
     bytes[i] = binary.charCodeAt(i);
@@ -53,6 +55,7 @@ export class WebCryptoVault {
       false,
       ["encrypt", "decrypt"]
     );
+    rawKey.fill(0);
     return new WebCryptoVault(cryptoKey);
   }
 
@@ -61,6 +64,7 @@ export class WebCryptoVault {
     crypto.getRandomValues(rawKey);
     const base64Key = uint8ArrayToBase64(rawKey);
     const vault = await WebCryptoVault.importKey(base64Key);
+    rawKey.fill(0);
     return { base64Key, vault };
   }
 
@@ -76,12 +80,12 @@ export class WebCryptoVault {
     const encryptedBuffer = await crypto.subtle.encrypt(
       {
         name: "AES-GCM",
-        iv: nonce,
-        additionalData: aad,
+        iv: viewBuffer(nonce),
+        additionalData: viewBuffer(aad),
         tagLength: 128,
       },
       this.cryptoKey,
-      encodedData
+      viewBuffer(encodedData)
     );
 
     const fullCiphertext = new Uint8Array(encryptedBuffer);
@@ -101,6 +105,10 @@ export class WebCryptoVault {
       const nonce = base64ToUint8Array(nonceB64);
       const tag = base64ToUint8Array(tagB64);
       const ciphertext = base64ToUint8Array(cipherB64);
+
+      if (nonce.byteLength !== 12 || tag.byteLength !== 16) {
+        throw new Error("Invalid nonce or authentication tag length");
+      }
 
       // Recombine ciphertext and 16-byte tag for SubtleCrypto decrypt
       const combined = concatUint8Arrays(ciphertext, tag);

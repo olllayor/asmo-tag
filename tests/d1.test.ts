@@ -63,6 +63,21 @@ describe("SQL parameter translation", () => {
   it("rejects named parameters D1 cannot bind", () => {
     expect(() => prepareSql("SELECT * FROM t WHERE kind=$kind", ["x"])).toThrow("Unknown SQL parameter $kind");
   });
+
+  it("leaves unquoted column names containing a $ character uncorrupted", () => {
+    const q = prepareSql("SELECT item$1 FROM t WHERE id=$1", ["val"]);
+    expect(q.sql).toBe("SELECT item$1 FROM t WHERE id=?1");
+    expect(q.bindings).toEqual(["val"]);
+  });
+
+  it("rejects positional ? placeholders", () => {
+    expect(() => prepareSql("SELECT * FROM t WHERE id = ?", ["val"])).toThrow("Positional ? parameters are not supported");
+  });
+
+  it("rejects parameters with leading zeros or zero index", () => {
+    expect(() => prepareSql("SELECT $0 FROM t", ["val"])).toThrow("Unknown SQL parameter $0");
+    expect(() => prepareSql("SELECT $01 FROM t", ["val"])).toThrow("Unknown SQL parameter $01");
+  });
 });
 
 describe("Cloudflare D1 migration", () => {

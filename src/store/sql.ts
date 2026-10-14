@@ -45,6 +45,9 @@ function endOfQuoted(sql: string, start: number): number {
   return sql.length;
 }
 
+const isIdentifierChar = (char: string | undefined): boolean =>
+  char !== undefined && /[a-zA-Z0-9_]/.test(char);
+
 export function prepareSql(sql: string, parameters: unknown[] = [], workspaceId?: string): { sql: string; bindings: unknown[] } {
   const paramMap = new Map<string, number>();
   const bindings: unknown[] = [];
@@ -79,19 +82,33 @@ export function prepareSql(sql: string, parameters: unknown[] = [], workspaceId?
       cursor = stop;
       continue;
     }
-    namedParameter.lastIndex = cursor;
-    const match = namedParameter.exec(sql);
-    if (!match) {
-      translated += char;
-      cursor += 1;
+    if (char === "?") {
+      throw new Error("Positional ? parameters are not supported; use $1..$n or $workspace");
+    }
+    if (char === "$") {
+      const prev = cursor > 0 ? sql[cursor - 1] : undefined;
+      if (isIdentifierChar(prev)) {
+        translated += char;
+        cursor += 1;
+        continue;
+      }
+      namedParameter.lastIndex = cursor;
+      const match = namedParameter.exec(sql);
+      if (!match) {
+        translated += char;
+        cursor += 1;
+        continue;
+      }
+      const [token, name = ""] = match;
+      if (name === "workspace") translated += index(name, workspaceId ?? null);
+      else if (!/^[1-9]\d*$/.test(name)) throw new Error(`Unknown SQL parameter $${name}`);
+      else if (Number(name) < 1 || Number(name) > parameters.length) throw new Error(`SQL parameter $${name} is out of range; ${parameters.length} parameter(s) supplied`);
+      else translated += index(name, parameters[Number(name) - 1] ?? null);
+      cursor += token.length;
       continue;
     }
-    const [token, name = ""] = match;
-    if (name === "workspace") translated += index(name, workspaceId ?? null);
-    else if (!/^\d+$/.test(name)) throw new Error(`Unknown SQL parameter $${name}`);
-    else if (Number(name) < 1 || Number(name) > parameters.length) throw new Error(`SQL parameter $${name} is out of range; ${parameters.length} parameter(s) supplied`);
-    else translated += index(name, parameters[Number(name) - 1] ?? null);
-    cursor += token.length;
+    translated += char;
+    cursor += 1;
   }
   return { sql: translated, bindings };
 }

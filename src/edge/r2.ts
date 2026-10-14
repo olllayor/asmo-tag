@@ -84,7 +84,7 @@ export class EdgeArtifactStore {
     const metadata = obj.customMetadata ?? {};
     // putArtifact records the digest in metadata; a mismatch means the stored bytes are
     // not what was written, so fail loudly instead of running on corrupt input.
-    if (metadata.sha256 && (await sha256Hex(data)) !== metadata.sha256) {
+    if (metadata.sha256 && (await sha256Hex(data)).toLowerCase() !== metadata.sha256.toLowerCase()) {
       throw new Error(`Artifact ${key} failed SHA-256 validation`);
     }
     return {

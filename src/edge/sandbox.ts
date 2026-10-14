@@ -29,18 +29,26 @@ export class EphemeralHttpSandboxConnector implements SandboxConnector {
     private readonly endpoint: string,
     private readonly apiKey: string,
     private readonly fetcher: typeof globalThis.fetch = globalThis.fetch
-  ) {}
+  ) {
+    if (!endpoint || (!endpoint.startsWith("https://") && !endpoint.startsWith("http://"))) {
+      throw new Error("Sandbox endpoint must be a valid HTTP or HTTPS URL");
+    }
+    if (!apiKey.trim()) {
+      throw new Error("Sandbox API key must not be empty");
+    }
+  }
 
   async execute(options: SandboxExecutionOptions, signal?: AbortSignal): Promise<SandboxExecutionResult> {
     const started = Date.now();
-    const timeout = options.timeoutMs ?? 30_000;
+    const rawTimeout = options.timeoutMs ?? 30_000;
+    const timeout = Math.max(1_000, Math.min(Number.isFinite(rawTimeout) ? rawTimeout : 30_000, 120_000));
     const bounded = signal ? AbortSignal.any([signal, AbortSignal.timeout(timeout)]) : AbortSignal.timeout(timeout);
 
     const response = await this.fetcher(this.endpoint, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${this.apiKey}`,
+        "Authorization": `Bearer ${this.apiKey.trim()}`,
       },
       body: JSON.stringify({
         command: options.command,
@@ -52,12 +60,20 @@ export class EphemeralHttpSandboxConnector implements SandboxConnector {
     });
 
     if (!response.ok) {
-      throw new Error(`Sandbox execution failed with HTTP status ${response.status}`);
+      const errorText = await response.text().catch(() => "");
+      throw new Error(`Sandbox execution failed with HTTP status ${response.status}${errorText ? `: ${errorText.slice(0, 500)}` : ""}`);
+    }
+
+    let payload: unknown;
+    try {
+      payload = await response.json();
+    } catch {
+      throw new Error("Sandbox execution returned a non-JSON response");
     }
 
     // The sandbox is a trust boundary: a malformed result must fail loudly, not surface
     // as exitCode 0 with empty output.
-    const parsed = sandboxResultSchema.safeParse(await response.json());
+    const parsed = sandboxResultSchema.safeParse(payload);
     if (!parsed.success) {
       throw new Error("Sandbox execution returned a malformed result");
     }

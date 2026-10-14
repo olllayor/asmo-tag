@@ -959,8 +959,12 @@ class SQLiteStore implements Store {
       await db.query("UPDATE jobs SET state='done' WHERE workspace_id=$workspace AND id=$1 AND token=$2", [job.lease.id, job.lease.token]);
       if (!valid) {
         await event(db, scope, task.id, null, "model_result_fenced", { epoch: reservation.epoch, currentEpoch: task.epoch }, this.now());
-        if (row?.token === job.lease.token && liveStates.has(task.state) && authorized) { const queued: Task = { ...task, state: "queued" }; await save(db, "tasks", queued); await queue(db, scope, task.id, "model", task.id, {}, this.now()); }
-        await this.advance(db, scope, task);
+        if (row?.token === job.lease.token && task.epoch === reservation.epoch && liveStates.has(task.state) && authorized) {
+          const queued: Task = { ...task, state: "queued" };
+          await save(db, "tasks", queued);
+          await queue(db, scope, task.id, "model", task.id, {}, this.now());
+          await this.advance(db, scope, task);
+        }
         return;
       }
       const toolIds = result.message.content.filter(block => block.type === "tool_use").map(block => block.id);

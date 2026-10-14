@@ -1,5 +1,3 @@
-import type { Scope, Store } from "../core.js";
-
 export interface KVNamespace {
   get(key: string, options?: { type?: "text" | "json" | "arrayBuffer" | "stream" }): Promise<any>;
   put(key: string, value: string | ArrayBuffer | ReadableStream, options?: { expiration?: number; expirationTtl?: number }): Promise<void>;
@@ -28,11 +26,14 @@ export class EdgeKvCache {
     const bucket = Math.floor(Date.now() / (windowSeconds * 1000));
     const kvKey = `rate:${key}:${bucket}`;
     try {
-      const count = Number(await this.kv.get(kvKey, { type: "text" }) ?? 0);
+      const raw = await this.kv.get(kvKey, { type: "text" });
+      const parsed = Number(raw ?? 0);
+      const count = Number.isFinite(parsed) ? parsed : 0;
       if (count >= limit) {
         return { allowed: false, remaining: 0 };
       }
-      await this.kv.put(kvKey, String(count + 1), { expirationTtl: windowSeconds * 2 });
+      // Cloudflare KV enforces a minimum expirationTtl of 60 seconds
+      await this.kv.put(kvKey, String(count + 1), { expirationTtl: Math.max(60, windowSeconds * 2) });
       return { allowed: true, remaining: limit - count - 1 };
     } catch {
       return { allowed: true, remaining: limit };

@@ -10,18 +10,21 @@ import type { D1Database } from "../src/store/d1.js";
 import { createMockD1 } from "./helpers/mock-d1.js";
 
 
-function createMockKV(): KVNamespace & { store: Map<string, string> } {
+function createMockKV(): KVNamespace & { store: Map<string, string>; putOptions: Map<string, any> } {
   const store = new Map<string, string>();
+  const putOptions = new Map<string, any>();
   return {
     store,
+    putOptions,
     async get(key: string, options?: { type?: string }) {
       const val = store.get(key);
       if (val === undefined) return null;
       if (options?.type === "json") return JSON.parse(val);
       return val;
     },
-    async put(key: string, value: string | ArrayBuffer | ReadableStream) {
+    async put(key: string, value: string | ArrayBuffer | ReadableStream, options?: any) {
       store.set(key, typeof value === "string" ? value : String(value));
+      if (options) putOptions.set(key, options);
     },
     async delete(key: string) {
       store.delete(key);
@@ -50,6 +53,32 @@ describe("WebCryptoVault (AES-256-GCM)", () => {
     await expect(
       vault.decrypt(encrypted, "tampered_binding")
     ).rejects.toThrow("could not decrypt credential");
+  });
+
+  it("rejects decryption if nonce or tag length is invalid", async () => {
+    const { vault } = await WebCryptoVault.generateKey();
+    const badNonce = JSON.stringify([
+      Buffer.from("short").toString("base64"),
+      Buffer.alloc(16).toString("base64"),
+      Buffer.from("ciphertext").toString("base64"),
+    ]);
+    await expect(vault.decrypt(badNonce, "binding")).rejects.toThrow("could not decrypt credential");
+
+    const badTag = JSON.stringify([
+      Buffer.alloc(12).toString("base64"),
+      Buffer.from("short-tag").toString("base64"),
+      Buffer.from("ciphertext").toString("base64"),
+    ]);
+    await expect(vault.decrypt(badTag, "binding")).rejects.toThrow("could not decrypt credential");
+  });
+
+  it("handles URL-safe base64 encoding seamlessly", async () => {
+    const rawKey = randomBytes(32);
+    const urlSafeKey = rawKey.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    const vault = await WebCryptoVault.importKey(urlSafeKey);
+    const encrypted = await vault.encrypt({ key: "val" }, "scope");
+    const decrypted = await vault.decrypt(encrypted, "scope");
+    expect(decrypted).toEqual({ key: "val" });
   });
 
   it("is cross-compatible with Node.js crypto cipher/decipher", async () => {
@@ -102,6 +131,15 @@ describe("EdgeKvCache and Rate Limiting", () => {
     const third = await cache.checkRateLimit("client-123", 2, 60);
     expect(third.allowed).toBe(false);
     expect(third.remaining).toBe(0);
+  });
+
+  it("respects minimum expirationTtl of 60 seconds for small windows", async () => {
+    const kv = createMockKV();
+    const cache = new EdgeKvCache(kv);
+    const result = await cache.checkRateLimit("short-window", 10, 10);
+    expect(result.allowed).toBe(true);
+    const opts = Array.from(kv.putOptions.values())[0];
+    expect(opts?.expirationTtl).toBeGreaterThanOrEqual(60);
   });
 
   it("returns 429 when rate limit is exceeded on webhook endpoint", async () => {

@@ -270,9 +270,9 @@ export async function handleWebhookRequest(
         }
       }
       if (ctx?.waitUntil) {
-        // drainJobs has its own error handling only for store work; keep a background
-        // failure from surfacing as an unhandled rejection.
-        ctx.waitUntil(drainJobs(env, 10).catch((error: unknown) => { console.error("Background drain failed:", error); }));
+        // Immediate fast-path only drains up to 2 jobs to stay well within edge execution limits;
+        // background queue handles full batch execution with automatic retries.
+        ctx.waitUntil(drainJobs(env, 2).catch((error: unknown) => { console.error("Background drain failed:", error); }));
       }
     }
 

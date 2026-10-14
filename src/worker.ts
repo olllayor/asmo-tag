@@ -40,9 +40,9 @@ export class Worker {
     return true;
   }
 
-  async drain(limit = 200): Promise<number> {
+  async drain(limit = 200, workerId = "fixture-drain"): Promise<number> {
     let worked = 0;
-    for (; worked < limit; worked++) if (!await this.step("fixture-drain")) break;
+    for (; worked < limit; worked++) if (!await this.step(workerId)) break;
     return worked;
   }
 }

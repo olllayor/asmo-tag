@@ -78,6 +78,32 @@ describe("EdgeArtifactStore (Cloudflare R2)", () => {
     expect(await store.getArtifact("artifacts/task-123.log")).toBeNull();
   });
 
+  it("detects and rejects corrupted artifacts failing SHA-256 validation", async () => {
+    const mockR2 = createMockR2();
+    const store = new EdgeArtifactStore(mockR2);
+
+    await store.putArtifact("artifacts/tampered.log", "original content");
+    // Corrupt the underlying storage data
+    const stored = mockR2.storage.get("artifacts/tampered.log")!;
+    stored.data = new TextEncoder().encode("tampered content");
+
+    await expect(store.getArtifact("artifacts/tampered.log")).rejects.toThrow("failed SHA-256 validation");
+  });
+
+  it("validates SHA-256 digests case-insensitively", async () => {
+    const mockR2 = createMockR2();
+    const store = new EdgeArtifactStore(mockR2);
+
+    const result = await store.putArtifact("artifacts/case.log", "content");
+    const stored = mockR2.storage.get("artifacts/case.log")!;
+    // Uppercase the stored metadata digest
+    stored.metadata.sha256 = result.sha256.toUpperCase();
+
+    const retrieved = await store.getArtifact("artifacts/case.log");
+    expect(retrieved).not.toBeNull();
+    expect(retrieved?.text()).toBe("content");
+  });
+
   it("fails closed when no R2 binding is configured", async () => {
     const store = new EdgeArtifactStore();
     expect(store.configured).toBe(false);
@@ -146,6 +172,43 @@ describe("Ephemeral Sandbox Connector", () => {
         }),
       })
     );
+  });
+
+  it("surfaces detailed error responses from sandbox API on non-200 status", async () => {
+    const mockFetcher = vi.fn().mockResolvedValue(
+      new Response("Worker pool out of memory", { status: 500 })
+    );
+    const connector = new EphemeralHttpSandboxConnector(
+      "https://sandbox.internal/execute",
+      "sb_key_999",
+      mockFetcher as any
+    );
+
+    await expect(connector.execute({ command: "crash" })).rejects.toThrow("failed with HTTP status 500: Worker pool out of memory");
+  });
+
+  it("handles non-JSON and malformed responses from sandbox gracefully", async () => {
+    const nonJsonFetcher = vi.fn().mockResolvedValue(
+      new Response("<html>Bad Gateway</html>", { status: 200, headers: { "Content-Type": "text/html" } })
+    );
+    const connector = new EphemeralHttpSandboxConnector(
+      "https://sandbox.internal/execute",
+      "sb_key_999",
+      nonJsonFetcher as any
+    );
+
+    await expect(connector.execute({ command: "ls" })).rejects.toThrow("non-JSON response");
+
+    const malformedFetcher = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ unexpected: true }), { status: 200, headers: { "Content-Type": "application/json" } })
+    );
+    const badSchemaConnector = new EphemeralHttpSandboxConnector(
+      "https://sandbox.internal/execute",
+      "sb_key_999",
+      malformedFetcher as any
+    );
+
+    await expect(badSchemaConnector.execute({ command: "ls" })).rejects.toThrow("malformed result");
   });
 
   it("creates appropriate connector via factory", () => {
