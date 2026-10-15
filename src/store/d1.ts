@@ -1,3 +1,5 @@
+// Experimental D1 storage backend. Not the supported deployment. Read
+// docs/engineering/edge-experimental.md before changing this file.
 import type { Db, Row } from "./sql.js";
 import { binding, decode, prepareSql } from "./sql.js";
 import { migrationStatements, schemaVersion } from "./schema.js";

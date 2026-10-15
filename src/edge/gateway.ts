@@ -1,3 +1,5 @@
+// Experimental Workers gateway. Not the supported deployment. Read
+// docs/engineering/edge-experimental.md before changing this file.
 import { createHash, timingSafeEqual } from "node:crypto";
 import type { D1Database } from "../store/d1.js";
 import { openStore } from "../store/index.js";

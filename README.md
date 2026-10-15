@@ -95,7 +95,7 @@ Text attachments support bounded UTF-8 `.txt`, `.md`, `.csv`, `.log`, and `.json
 
 ## Remaining release work
 
-Read `docs/product/acceptance-plan.md` for the full local, connected, expanded, and release gates. Read [the current Responses and connector report](docs/engineering/responses-connectors-report.md) for observed evidence and current gaps. Local tests cannot establish live provider cancellation, Telegram delivery exactly once, real GitHub token revocation, useful AI outcomes, or production restore behavior.
+Read `docs/product/acceptance-plan.md` for the full local, connected, expanded, and release gates. Read [the current Responses and connector report](docs/engineering/responses-connectors-report.md) for observed evidence and current gaps. The Workers gateway and D1 storage backend under `src/edge` are experimental and not a supported deployment. Read [the edge status note](docs/engineering/edge-experimental.md) for its gaps and the reopen condition. Local tests cannot establish live provider cancellation, Telegram delivery exactly once, real GitHub token revocation, useful AI outcomes, or production restore behavior.
 
 Connected work still needs live membership/permission races, webhook retry behavior, real billing reconciliation, provider token-refresh smoke tests, retention expiry, backup/restore drills, and end-to-end mobile Telegram checks. The standard bot cannot retrieve arbitrary old group history. General Telegram deletion events are unavailable, so source removal must be explicit.
 
