@@ -3,7 +3,7 @@ import type { SQLInputValue } from "node:sqlite";
 import { closeSync, mkdirSync, openSync, realpathSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import type { z } from "zod";
-import { migrationSql, schemaVersion } from "./schema.js";
+import { migrationSql, schemaUpgrades, schemaVersion } from "./schema.js";
 import { binding, decode } from "./sql.js";
 import type { Db, Row } from "./sql.js";
 import { inD1Transaction } from "./d1.js";
@@ -47,12 +47,19 @@ export class Connection {
   migrate(): void {
     if (this.migrated) return;
     const row = this.database.prepare("PRAGMA user_version").get();
-    const currentVersion = Number(row?.user_version);
+    let currentVersion = Number(row?.user_version);
     if (currentVersion > schemaVersion) throw new Error("SQLite schema is newer than this application");
     if (currentVersion === 0) {
       this.database.exec(migrationSql);
-      this.database.exec(`PRAGMA user_version=${schemaVersion}`);
+      currentVersion = schemaVersion;
+    } else {
+      for (const upgrade of schemaUpgrades) {
+        if (currentVersion >= upgrade.version) continue;
+        this.database.exec(upgrade.statements.map(statement => `${statement};`).join("\n"));
+        currentVersion = upgrade.version;
+      }
     }
+    this.database.exec(`PRAGMA user_version=${currentVersion}`);
     this.migrated = true;
   }
   close(): void { this.database.close(); }

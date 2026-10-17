@@ -53,4 +53,38 @@ describe("TelegramAuthority caching", () => {
     await expect(authority.refresh(scope, "101")).rejects.toThrow("Access denied.");
     expect(store.membership).toHaveBeenCalledWith("scope-1", "101", null);
   });
+
+  it("treats a pushed membership update as a fresh observation instead of trusting the cache", async () => {
+    const member = vi.fn(async () => ({ status: "administrator" }));
+    const authority = authorityWith(member, vi.fn(async () => botAdmin));
+    await authority.refresh(scope, "101");
+    authority.observe(scope.id, "101", null);
+    await expect(authority.refresh(scope, "101")).rejects.toThrow("Access denied.");
+    expect(member).toHaveBeenCalledTimes(1);
+    expect(store.membership).toHaveBeenLastCalledWith("scope-1", "101", null);
+  });
+
+  it("falls back to a completed observation within the stale limit and throws past it", async () => {
+    vi.useFakeTimers();
+    try {
+      const member = vi.fn(async () => ({ status: "member" }));
+      const authority = authorityWith(member, vi.fn(async () => botAdmin));
+      await authority.refresh(scope, "101");
+      member.mockRejectedValue(new Error("Too Many Requests: retry after 5"));
+      vi.advanceTimersByTime(6_000);
+      await expect(authority.refresh(scope, "101")).resolves.toBeUndefined();
+      expect(store.membership).toHaveBeenLastCalledWith("scope-1", "101", "member");
+      vi.advanceTimersByTime(300_000);
+      await expect(authority.refresh(scope, "101")).rejects.toThrow("Too Many Requests");
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("gates ingest freshness on a recent observation per scope kind", async () => {
+    const authority = authorityWith(vi.fn(async () => ({ status: "member" })), vi.fn(async () => botAdmin));
+    expect(authority.recent(scope, "101")).toBe(false);
+    await authority.refresh(scope, "101");
+    expect(authority.recent(scope, "101")).toBe(true);
+    expect(authority.recent({ ...scope, kind: "dm", ownerId: "101" }, "101")).toBe(true);
+    expect(authority.recent({ ...scope, kind: "dm", ownerId: "102" }, "101")).toBe(false);
+  });
 });

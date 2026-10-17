@@ -302,7 +302,7 @@ describe("Cloudflare D1 store lifecycle", () => {
     await expect(openStore(storeOptions(d1, () => Date.now()))).rejects.toThrow("newer than this application");
 
     // Once the cause is gone the same binding must start again instead of replaying the error.
-    rawDb.exec("UPDATE asmo_schema_meta SET version=1 WHERE name='schema'");
+    rawDb.exec(`UPDATE asmo_schema_meta SET version=${schemaVersion} WHERE name='schema'`);
     const store = await openStore(storeOptions(d1, () => Date.now()));
     await store.close();
     rawDb.close();

@@ -134,6 +134,23 @@ export class TelegramAuthority {
 
   constructor(token: string, private readonly botId: string, private readonly store: Store, api: Api = new Api(token, { timeoutSeconds: 20 })) { this.api = api; }
 
+  // A pushed membership update is itself a fresh observation. Without this the cached role
+  // survives a demotion and refresh writes it back over the row the update just cleared.
+  observe(scopeId: string, userId: string, role: "manager" | "member" | null): void {
+    this.members.set(`${scopeId}:${userId}`, { role, at: Date.now() });
+  }
+
+  invalidateBot(chatId: string): void { this.bots.delete(chatId); }
+
+  // True when the last successful observation can still authorize intake. The webhook checks
+  // this so a swallowed refresh failure cannot extend the stale window with the outage.
+  recent(scope: Scope, userId: string): boolean {
+    if (scope.kind === "dm") return scope.ownerId === userId;
+    if (scope.kind !== "group") return false;
+    const last = this.members.get(`${scope.id}:${userId}`);
+    return last?.role !== undefined && Date.now() - last.at <= memberStaleLimitMs;
+  }
+
   async refresh(scope: Scope, userId: string): Promise<void> {
     if (scope.kind === "dm") {
       if (scope.ownerId !== userId) throw new Error("Access denied.");
@@ -185,8 +202,8 @@ export class TelegramAuthority {
     });
     if (!cached) this.members.set(key, entry);
     if (this.members.size > maxMemberEntries) {
-      const oldest = this.members.keys().next().value;
-      if (oldest !== undefined) this.members.delete(oldest);
+      // Evict the oldest settled entry so an in-flight check is never detached from its key.
+      for (const [key, candidate] of this.members) if (candidate.promise === undefined) { this.members.delete(key); break; }
     }
     entry.promise.then(role => { entry.role = role; entry.at = Date.now(); }).catch(() => { /* keep the last-known observation for the stale fallback */ }).finally(() => { delete entry.promise; });
     return entry.promise;

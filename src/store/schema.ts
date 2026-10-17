@@ -1,8 +1,10 @@
-export const schemaVersion = 1;
+export const schemaVersion = 2;
 
-// One entry per schema statement. The Node backend execs the joined text inside a single
-// BEGIN IMMEDIATE; the D1 backend sends the same list as one batch, which D1 runs as a
-// transaction. Every entry must stay a single statement with no semicolon inside it.
+const messagesTaskIndex = "CREATE INDEX messages_task ON messages(workspace_id,scope_id,task_id);";
+
+// One entry per schema statement, in creation order. The Node backend execs the joined text
+// inside a single BEGIN IMMEDIATE; the D1 backend sends the same list as one batch, which D1
+// runs as a transaction. Every entry must stay a single statement with no semicolon inside it.
 export const migrationStatements = [
   `CREATE TABLE workspaces (
  id TEXT PRIMARY KEY NOT NULL, bot_id TEXT NOT NULL, owner_id TEXT NOT NULL, name TEXT NOT NULL,
@@ -37,6 +39,8 @@ export const migrationStatements = [
  PRIMARY KEY(workspace_id,scope_id,chat_id,message_id), FOREIGN KEY(workspace_id,scope_id) REFERENCES scopes(workspace_id,id),
  FOREIGN KEY(workspace_id,scope_id,task_id) REFERENCES tasks(workspace_id,scope_id,id), FOREIGN KEY(workspace_id,scope_id,source_id) REFERENCES sources(workspace_id,scope_id,id)
 );`,
+  // The primary key cannot serve task lookups, and the task view resolves captures per task.
+  messagesTaskIndex,
   `CREATE TABLE transcripts (
  workspace_id TEXT NOT NULL, scope_id TEXT NOT NULL, task_id TEXT NOT NULL, sequence INTEGER NOT NULL, data TEXT NOT NULL CHECK(json_valid(data)),
  PRIMARY KEY(workspace_id,task_id,sequence), FOREIGN KEY(workspace_id,scope_id,task_id) REFERENCES tasks(workspace_id,scope_id,id)
@@ -106,3 +110,10 @@ export const migrationStatements = [
 ];
 
 export const migrationSql = `${migrationStatements.map(statement => `${statement};`).join("\n")}\n`;
+
+// Statements added after an earlier version, keyed by the version that introduces them. A
+// database created by an older version replays only the entries newer than its own version,
+// in order. Fresh databases run migrationStatements, which already contains every entry.
+export const schemaUpgrades = [
+  { version: 2, statements: [messagesTaskIndex] },
+];

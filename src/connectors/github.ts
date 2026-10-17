@@ -133,6 +133,15 @@ export function createGitHubConnector(options: Options): IssueConnector {
           mapped = mapped.slice(0, -1);
           truncated = true;
         }
+        if (Buffer.byteLength(JSON.stringify(mapped)) > 25_000 && mapped.length === 1) {
+          // One issue can exceed the budget on its own (long labels or body). Keep its
+          // identity so the model can still act on it, and drop the payload fields.
+          const [single] = mapped;
+          if (single) {
+            mapped = [{ ...single, body: null, labels: [] }];
+            truncated = true;
+          }
+        }
         return receiptSchema.parse({
           providerId: `github-read:${repository}`,
           url: null,

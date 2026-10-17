@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import { migrateDatabase, openStore } from "../src/store/index.js";
 import type { Connection } from "../src/store/connection.js";
 import { connectDatabase, inDatabaseTransaction } from "../src/store/connection.js";
+import { migrationSql, schemaVersion } from "../src/store/schema.js";
 
 describe("SQLite migration and durability policy", () => {
   it("initializes a private versioned database and keeps repeated migrations idempotent", async () => {
@@ -15,7 +16,7 @@ describe("SQLite migration and durability policy", () => {
       await Promise.all([migrateDatabase(path), migrateDatabase(path)]);
       const db = new DatabaseSync(path);
       try {
-        expect(db.prepare("PRAGMA user_version").get()?.user_version).toBe(1);
+        expect(db.prepare("PRAGMA user_version").get()?.user_version).toBe(schemaVersion);
         expect(db.prepare("PRAGMA journal_mode").get()?.journal_mode).toBe("delete");
         expect(db.prepare("PRAGMA integrity_check").get()?.integrity_check).toBe("ok");
         expect((await stat(path)).mode & 0o777).toBe(0o600);
@@ -39,12 +40,29 @@ describe("SQLite migration and durability policy", () => {
     const path = join(directory, "database.sqlite");
     try {
       const db = new DatabaseSync(path);
-      db.exec("PRAGMA user_version=2; CREATE TABLE future_data(value TEXT); INSERT INTO future_data VALUES('retained');");
+      db.exec(`PRAGMA user_version=${schemaVersion + 1}; CREATE TABLE future_data(value TEXT); INSERT INTO future_data VALUES('retained');`);
       db.close();
       await expect(openStore({ databasePath: path, modelReserveMicros: 1000, maxOutputTokens: 1024, maxTurns: 4, taskBudgetMicros: 10000, leaseMs: 1000, simulated: true })).rejects.toThrow("newer than this application");
       const inspect = new DatabaseSync(path);
       try { expect(inspect.prepare("SELECT value FROM future_data").get()?.value).toBe("retained"); }
       finally { inspect.close(); }
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+  it("adds the task-message index when opening a version 1 database", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "asmo-upgrade-"));
+    const path = join(directory, "database.sqlite");
+    try {
+      const legacy = new DatabaseSync(path);
+      legacy.exec(migrationSql);
+      legacy.exec("DROP INDEX messages_task; PRAGMA user_version=1;");
+      legacy.close();
+      const store = await openStore({ databasePath: path, modelReserveMicros: 1000, maxOutputTokens: 1024, maxTurns: 4, taskBudgetMicros: 10000, leaseMs: 1000, simulated: true });
+      await store.close();
+      const inspect = new DatabaseSync(path);
+      try {
+        expect(inspect.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='messages_task'").get()?.name).toBe("messages_task");
+        expect(inspect.prepare("PRAGMA user_version").get()?.user_version).toBe(schemaVersion);
+      } finally { inspect.close(); }
     } finally { await rm(directory, { recursive: true, force: true }); }
   });
   it("closes the store handle when the shutdown transaction cannot acquire its lock", async () => {
