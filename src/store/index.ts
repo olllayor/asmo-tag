@@ -79,6 +79,10 @@ const deferredClaimMs = 250;
 const heldReleaseBatchSize = 20;
 const heldReleaseBackoffMs = [1_000, 5_000, 30_000, 120_000];
 const scopeSourceWindowLimit = 300;
+const activeMemoryLimitPerScope = 20;
+const maxToolResultBytes = 30_000;
+const memoryBudgetBytes = 25_000;
+const sourceBudgetBytes = 45_000;
 // Passive capture bounds. Sources over the retention cap are pruned oldest-first, and pure
 // passive messages stop being captured once a scope has captured this many in the window.
 // Both are overridable per store through StoreOptions.
@@ -363,7 +367,13 @@ class SQLiteStore implements Store {
     const effects = await records(db, "effects", effectSchema, "task_id=$1", [task.id]);
     const pending = uses.filter(use => !results.has(use.id)).map(use => ({ use, effect: effects.find(effect => effect.call.id === use.id) }));
     if (pending.some(({ effect }) => !effect || !["succeeded", "denied"].includes(effect.state))) return false;
-    await append(db, task, { role: "user", content: pending.map(({ use, effect }) => ({ type: "tool_result", tool_use_id: use.id, content: effect?.result ?? "Tool denied.", is_error: effect?.state !== "succeeded" })) });
+    await append(db, task, { role: "user", content: pending.map(({ use, effect }) => {
+      let result = effect?.result ?? "Tool denied.";
+      if (Buffer.byteLength(result) > maxToolResultBytes) {
+        result = `${result.slice(0, maxToolResultBytes)}\n[Tool result truncated to fit context budget]`;
+      }
+      return { type: "tool_result", tool_use_id: use.id, content: result, is_error: effect?.state !== "succeeded" };
+    }) });
     await this.flushNotes(db, task);
     return true;
   }
@@ -467,6 +477,10 @@ class SQLiteStore implements Store {
   }
   private async commandRemember(command: Extract<Command, { kind: "remember" }>, context: CommandContext): Promise<Receipt> {
     const { db, scope, userId, denied } = context;
+    if (!command.candidate) {
+      const activeCount = first(await rows(db, "SELECT count(*) AS count FROM memories WHERE workspace_id=$workspace AND scope_id=$1 AND data->>'state'='active'", [scope.id], z.object({ count: z.coerce.number().int() }))).count;
+      if (activeCount >= activeMemoryLimitPerScope) return denied(`Scope active memory limit reached (${activeMemoryLimitPerScope}).`);
+    }
     const evidence = await records(db, "sources", sourceSchema, "scope_id=$1 AND NOT deleted AND id IN (SELECT value FROM json_each($2))", [scope.id, command.evidenceIds]);
     if (evidence.length !== new Set(command.evidenceIds).size) return denied("Evidence unavailable in this scope.");
     const memory: Memory = { id: uuid(), scopeId: scope.id, content: command.content, evidenceIds: command.evidenceIds, revision: 1, state: command.candidate ? "candidate" : "active", authorId: userId, correctedByHuman: false };
@@ -479,6 +493,11 @@ class SQLiteStore implements Store {
     const memory = (await records(db, "memories", memorySchema, "scope_id=$1 AND id=$2", [scope.id, command.memoryId]))[0];
     if (!memory) return denied();
     if (command.kind === "correct_memory" && command.expectedRevision !== memory.revision) return denied("Memory changed. Reload before correcting.");
+    const becomingActive = memory.state !== "active" && (command.kind === "correct_memory" || (command.kind === "set_memory" && command.state === "active"));
+    if (becomingActive) {
+      const activeCount = first(await rows(db, "SELECT count(*) AS count FROM memories WHERE workspace_id=$workspace AND scope_id=$1 AND data->>'state'='active'", [scope.id], z.object({ count: z.coerce.number().int() }))).count;
+      if (activeCount >= activeMemoryLimitPerScope) return denied(`Scope active memory limit reached (${activeMemoryLimitPerScope}).`);
+    }
     const updated: Memory = command.kind === "correct_memory" ? { ...memory, content: command.content, revision: memory.revision + 1, correctedByHuman: true, state: "active" } : { ...memory, state: command.state, revision: memory.revision + 1 };
     await save(db, "memories", updated);
     await this.invalidateContextDependencies(db, scope, { sourceIds: [], memoryIds: [memory.id] });
@@ -1113,7 +1132,10 @@ class SQLiteStore implements Store {
       const deniedRead = effect.call.name !== "github_create_issue" && (!scope.active || scope.policyRevision !== effect.policyRevision || !await this.requesterAllowed(db, scope, task) || !await this.effectResourceAllowed(db, scope, effect));
       const redacted = deniedRead || first(await rows(db, "SELECT redacted FROM effects WHERE workspace_id=$workspace AND id=$1", [effect.id], z.object({ redacted: z.boolean() }))).redacted;
       if (redacted) await db.query("UPDATE effects SET redacted=true WHERE workspace_id=$workspace AND id=$1", [effect.id]);
-      const content = redacted ? "Effect receipt excluded after evidence or authorization changed." : receipt.content;
+      let content = redacted ? "Effect receipt excluded after evidence or authorization changed." : receipt.content;
+      if (Buffer.byteLength(content) > maxToolResultBytes) {
+        content = `${content.slice(0, maxToolResultBytes)}\n[Tool result truncated to fit context budget]`;
+      }
       const succeeded: Effect = { ...effect, state: "succeeded", providerId: deniedRead ? null : receipt.providerId, url: deniedRead ? null : receipt.url, result: content, reason: null };
       await save(db, "effects", succeeded);
       const source: Source = { id: uuid(), scopeId: scope.id, text: content, revision: 1, capturedAt: this.now(), messageId: null, kind: "tool" };

@@ -49,7 +49,7 @@ export function createGitHubConnector(options: Options): IssueConnector {
         repository,
         number: issue.number,
         title: issue.title,
-        body: issue.body,
+        body: issue.body ? (issue.body.length > 2000 ? `${issue.body.slice(0, 2000)}\n[Issue body truncated]` : issue.body) : null,
         labels: issue.labels.map((label) => (typeof label === 'string' ? label : label.name)),
         url: url.toString(),
       }),
@@ -126,16 +126,23 @@ export function createGitHubConnector(options: Options): IssueConnector {
           .array(issueSchema)
           .max(100)
           .parse(await request(repository, 'GET', signal));
+        const filtered = issues.filter((issue) => issue.pull_request === undefined);
+        let mapped = filtered.map((issue) => JSON.parse(receipt(issue, repository).content));
+        let truncated = false;
+        while (Buffer.byteLength(JSON.stringify(mapped)) > 25_000 && mapped.length > 1) {
+          mapped = mapped.slice(0, -1);
+          truncated = true;
+        }
         return receiptSchema.parse({
           providerId: `github-read:${repository}`,
           url: null,
           content: JSON.stringify({
             simulated: false,
             repository,
-            issues: issues
-              .filter((issue) => issue.pull_request === undefined)
-              .map((issue) => JSON.parse(receipt(issue, repository).content)),
-            coverage: 'First page of at most 100 issues and pull requests. Earlier pages were not retrieved.',
+            issues: mapped,
+            coverage: truncated
+              ? 'First page of issues and pull requests (truncated to fit tool result budget). Earlier pages were not retrieved.'
+              : 'First page of at most 100 issues and pull requests. Earlier pages were not retrieved.',
           }),
         });
       }

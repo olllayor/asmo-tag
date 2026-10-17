@@ -177,9 +177,12 @@ describe("Responses provider boundary", () => {
     expect(turn2.limitations.some(l => l.includes("truncated"))).toBe(true);
 
     // 3. Multiple large attachments
-    const sources = Array.from({ length: 4 }, (_, i) => ({
-      id: `src-${i}`, scopeId: "scope-1", text: "s".repeat(32_000), revision: 1, messageId: i + 1, capturedAt: 10 + i, kind: "text_file" as const,
-    }));
+    const sources = [
+      { id: "source-1", scopeId: "scope-1", text: "s".repeat(32_000), revision: 1, messageId: 1, capturedAt: 10, kind: "text_file" as const },
+      ...Array.from({ length: 3 }, (_, i) => ({
+        id: `src-${i + 2}`, scopeId: "scope-1", text: "s".repeat(32_000), revision: 1, messageId: i + 2, capturedAt: 11 + i, kind: "text_file" as const,
+      })),
+    ];
     const turn3 = await provider.turn({ ...input(), sources }, signal());
     expect(turn3.outcome).toBe("complete");
     expect(Buffer.byteLength(JSON.stringify(capturedBody))).toBeLessThanOrEqual(100_000);

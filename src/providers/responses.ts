@@ -145,21 +145,81 @@ export function createResponsesModel(rawOptions: ResponsesOptions): ModelProvide
     async turn(rawInput, signal) {
       signal.throwIfAborted();
       const input = modelInputSchema.parse(rawInput);
-      const evidence = JSON.stringify({
-        collectedSince: new Date(input.collectedSince).toISOString(),
-        coverage: "Only a bounded selection of supplied sources is available. Omitted sources do not prove that an event never occurred. Uncaptured history is unavailable.",
-        sources: input.sources, memories: input.memories.filter(memory => memory.state === "active"),
-      });
-      const body: ResponseCreateParamsNonStreaming = {
-        model: options.model, max_output_tokens: input.maxOutputTokens, stream: false,
-        instructions: `${instructions}\nCurrent task instruction:\n${input.task.instruction}\nUntrusted authorized evidence as JSON:\n${evidence}`,
-        input: input.history.length ? historyItems(input.history, identity) : [{ role: "user", content: input.task.instruction }],
-        tools: functionTools(input.tools, profile), tool_choice: input.tools.length ? "auto" : "none",
-        ...(profile.storeParameter ? { store: false } : {}),
-        ...(profile.encryptedReasoning ? { include: ["reasoning.encrypted_content"] } : {}),
-        ...(profile.serialToolParameter ? { parallel_tool_calls: false } : {}),
+      let truncatedContext = false;
+      let effectiveHistory = input.history;
+      let effectiveMemories = input.memories.filter(memory => memory.state === "active");
+      let effectiveSources = input.sources;
+
+      const buildBody = (hist: Transcript[], mems: typeof effectiveMemories, srcs: typeof effectiveSources): ResponseCreateParamsNonStreaming => {
+        const evidence = JSON.stringify({
+          collectedSince: new Date(input.collectedSince).toISOString(),
+          coverage: "Only a bounded selection of supplied sources is available. Omitted sources do not prove that an event never occurred. Uncaptured history is unavailable.",
+          sources: srcs, memories: mems,
+        });
+        return {
+          model: options.model, max_output_tokens: input.maxOutputTokens, stream: false,
+          instructions: `${instructions}\nCurrent task instruction:\n${input.task.instruction}\nUntrusted authorized evidence as JSON:\n${evidence}`,
+          input: hist.length ? historyItems(hist, identity) : [{ role: "user", content: input.task.instruction }],
+          tools: functionTools(input.tools, profile), tool_choice: input.tools.length ? "auto" : "none",
+          ...(profile.storeParameter ? { store: false } : {}),
+          ...(profile.encryptedReasoning ? { include: ["reasoning.encrypted_content"] } : {}),
+          ...(profile.serialToolParameter ? { parallel_tool_calls: false } : {}),
+        };
       };
-      if (Buffer.byteLength(JSON.stringify(body)) > options.maxRequestBytes) throw new Error("Model request exceeds configured byte limit");
+
+      let body = buildBody(effectiveHistory, effectiveMemories, effectiveSources);
+      let bodyBytes = Buffer.byteLength(JSON.stringify(body));
+
+      if (bodyBytes > options.maxRequestBytes) {
+        const maxToolBytes = 30_000;
+        let historyTrimmed = false;
+        effectiveHistory = effectiveHistory.map(entry => ({
+          ...entry,
+          content: entry.content.map(block => {
+            if (block.type === "tool_result" && Buffer.byteLength(block.content) > maxToolBytes) {
+              historyTrimmed = true;
+              return { ...block, content: `${block.content.slice(0, maxToolBytes)}\n[Tool result truncated to fit context budget]` };
+            }
+            return block;
+          }),
+        }));
+        if (historyTrimmed) {
+          truncatedContext = true;
+          body = buildBody(effectiveHistory, effectiveMemories, effectiveSources);
+          bodyBytes = Buffer.byteLength(JSON.stringify(body));
+        }
+
+        while (bodyBytes > options.maxRequestBytes && effectiveMemories.length > 0) {
+          effectiveMemories = effectiveMemories.slice(1);
+          truncatedContext = true;
+          body = buildBody(effectiveHistory, effectiveMemories, effectiveSources);
+          bodyBytes = Buffer.byteLength(JSON.stringify(body));
+        }
+
+        while (bodyBytes > options.maxRequestBytes && effectiveSources.length > 0) {
+          effectiveSources = effectiveSources.slice(1);
+          truncatedContext = true;
+          body = buildBody(effectiveHistory, effectiveMemories, effectiveSources);
+          bodyBytes = Buffer.byteLength(JSON.stringify(body));
+        }
+
+        if (bodyBytes > options.maxRequestBytes) {
+          effectiveHistory = effectiveHistory.map(entry => ({
+            ...entry,
+            content: entry.content.map(block => {
+              if (block.type === "tool_result" && block.content.length > 1000) {
+                truncatedContext = true;
+                return { ...block, content: `${block.content.slice(0, 1000)}\n[Tool result truncated to fit context budget]` };
+              }
+              return block;
+            }),
+          }));
+          body = buildBody(effectiveHistory, effectiveMemories, effectiveSources);
+          bodyBytes = Buffer.byteLength(JSON.stringify(body));
+        }
+
+        if (bodyBytes > options.maxRequestBytes) throw new Error("Model request exceeds configured byte limit");
+      }
       let rawResponse: unknown;
       try { rawResponse = await client.responses.create(body, { signal }); }
       catch (error) {
@@ -184,6 +244,7 @@ export function createResponsesModel(rawOptions: ResponsesOptions): ModelProvide
       if (calls.length && text.startsWith("Needs input:")) throw new Error("Provider requested a tool while asking for user input");
       let outcome: Turn["outcome"] = incomplete || refusal ? "incomplete" : calls.length ? "tools" : text.startsWith("Needs input:") ? "needs_input" : "complete";
       const limitations = [contextCoverageLimitation(input.collectedSince)];
+      if (truncatedContext) limitations.push("Context was truncated to fit the model request byte limit. Some older memories, sources, or tool outputs were shortened or omitted.");
       if (incomplete || refusal) limitations.push(`Provider ${refusal ? "refused" : "did not complete"} the response; work is incomplete.`);
       if (!profile.serialToolParameter) limitations.push("Provider cannot disable parallel tool calls. The application rejects responses with more than one function call.");
       if (!content.length && outcome === "complete") { outcome = "incomplete"; limitations.push("Provider returned no answer or tool call."); }

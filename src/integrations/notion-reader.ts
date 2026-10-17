@@ -39,8 +39,8 @@ export function createIntegrationNotionReader(service: IntegrationService, optio
         const content = blocks.results.flatMap(block => {
           const typed = z.object({ rich_text: richText }).safeParse(block[block.type]);
           return typed.success ? [typed.data.rich_text.map(item => item.plain_text).join('')] : [];
-        }).join('\n').slice(0, 100_000);
-        return { page: summary(result), content, coverage: 'Up to 100 direct blocks. Nested blocks, attachments, and linked pages are excluded.', truncated: blocks.has_more || blocks.results.some(block => block.has_children) || content.length >= 100_000 };
+        }).join('\n').slice(0, 20_000);
+        return { page: summary(result), content, coverage: 'Up to 100 direct blocks. Nested blocks, attachments, and linked pages are excluded.', truncated: blocks.has_more || blocks.results.some(block => block.has_children) || content.length >= 20_000 };
       });
     },
   };
