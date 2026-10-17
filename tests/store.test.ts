@@ -1121,6 +1121,41 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     } finally { db.close(); }
   });
 
+  it("caps active memories per scope and prevents memory explosion", async () => {
+    for (let i = 0; i < 20; i++) {
+      const receipt = await command({ kind: "remember", content: `Memory ${i}`, evidenceIds: [], candidate: false });
+      expect(receipt.kind).toBe("accepted");
+    }
+    const denied = await command({ kind: "remember", content: "Memory 20", evidenceIds: [], candidate: false });
+    expect(denied.kind).toBe("denied");
+    expect(denied.message).toContain("active memory limit");
+
+    const candidateReceipt = await command({ kind: "remember", content: "Candidate memory", evidenceIds: [], candidate: true });
+    expect(candidateReceipt.kind).toBe("accepted");
+    const candidateMem = (await store.view(scope.id, "member")).memories.find(m => m.state === "candidate");
+    if (!candidateMem) throw new Error("Candidate memory missing");
+
+    const activationDenied = await command({ kind: "set_memory", memoryId: candidateMem.id, state: "active" });
+    expect(activationDenied.kind).toBe("denied");
+    expect(activationDenied.message).toContain("active memory limit");
+  });
+
+  it("caps tool result size below request cap and truncates with visible limitation", async () => {
+    const taskId = await start("Check large tool result");
+    const model = await claimModel();
+    const callId = randomUUID();
+    await store.finishModel(model, turn("", { outcome: "tools", message: { role: "assistant", content: [{ type: "tool_use", id: callId, name: "github_read_issues", input: { repository: "fixture/engineering" } }] } }));
+    const effectJob = await store.claim("fixture-worker", "effect");
+    if (effectJob?.kind !== "effect") throw new Error("Effect job missing");
+    const hugeReceiptContent = "x".repeat(50_000);
+    await store.finishEffect(effectJob, { providerId: "huge-1", url: null, content: hugeReceiptContent });
+    const nextModel = await claimModel();
+    const toolResultBlock = nextModel.input.history[2]?.content[0];
+    if (!toolResultBlock || toolResultBlock.type !== "tool_result") throw new Error("Tool result block missing");
+    expect(toolResultBlock.content.length).toBeLessThanOrEqual(31_000);
+    expect(toolResultBlock.content).toContain("[Tool result truncated to fit context budget]");
+  });
+
 });
 
 describe("Held job release (L20)", () => {
@@ -1461,4 +1496,5 @@ describe("Passive ingestion caps (L20)", () => {
     expect(result?.limitations).toContain(coverage);
     expect(result?.limitations).toContain(boundedCaptureLimitation);
   });
+
 });

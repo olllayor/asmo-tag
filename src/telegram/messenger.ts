@@ -114,9 +114,25 @@ export function createFixtureMessenger(directory: string): Messenger {
   };
 }
 
+// Membership observations are cached briefly so floods, webhook redelivery, and Mini App
+// polling cannot drain the bot's Telegram API budget. Callers share in-flight checks, and a
+// Telegram outage falls back to the last-known role instead of failing every request.
+const memberTtlMs = 5_000;
+const memberStaleLimitMs = 300_000;
+const botTtlMs = 60_000;
+const maxMemberEntries = 5_000;
+const maxConcurrentChecks = 4;
+
+type MemberEntry = { role?: "manager" | "member" | null; at: number; promise?: Promise<"manager" | "member" | null> };
+
 export class TelegramAuthority {
   private readonly api: Api;
-  constructor(token: string, private readonly botId: string, private readonly store: Store) { this.api = new Api(token, { timeoutSeconds: 20 }); }
+  private readonly members = new Map<string, MemberEntry>();
+  private readonly bots = new Map<string, { at: number; promise: Promise<void> }>();
+  private active = 0;
+  private readonly queued: (() => void)[] = [];
+
+  constructor(token: string, private readonly botId: string, private readonly store: Store, api: Api = new Api(token, { timeoutSeconds: 20 })) { this.api = api; }
 
   async refresh(scope: Scope, userId: string): Promise<void> {
     if (scope.kind === "dm") {
@@ -124,11 +140,55 @@ export class TelegramAuthority {
       return;
     }
     if (scope.kind !== "group") throw new Error("Access denied.");
-    const bot = await this.api.getChatMember(scope.chatId, Number(this.botId));
-    if (bot.status !== "administrator" && bot.status !== "creator") throw new Error("Asmo needs administrator membership for reliable member checks.");
-    const member = await this.api.getChatMember(scope.chatId, Number(userId));
-    const role = ["creator", "administrator"].includes(member.status) ? "manager" : member.status === "member" || (member.status === "restricted" && member.is_member) ? "member" : null;
+    await this.botAdmin(scope.chatId);
+    let role: "manager" | "member" | null;
+    try {
+      role = await this.memberRole(scope, userId);
+    } catch (error) {
+      const last = this.members.get(`${scope.id}:${userId}`);
+      if (last?.role === undefined || Date.now() - last.at > memberStaleLimitMs) throw error;
+      console.error("Membership refresh failed. Continuing with the last-known role.");
+      role = last.role;
+    }
     await this.store.membership(scope.id, userId, role);
     if (role === null) throw new Error("Access denied.");
+  }
+
+  private async limited<T>(work: () => Promise<T>): Promise<T> {
+    while (this.active >= maxConcurrentChecks) await new Promise<void>(resolve => this.queued.push(resolve));
+    this.active++;
+    try { return await work(); } finally { this.active--; this.queued.shift()?.(); }
+  }
+
+  private botAdmin(chatId: string): Promise<void> {
+    const cached = this.bots.get(chatId);
+    if (cached && Date.now() - cached.at < botTtlMs) return cached.promise;
+    const entry = { at: Date.now(), promise: this.limited(async () => {
+      const bot = await this.api.getChatMember(chatId, Number(this.botId));
+      if (bot.status !== "administrator" && bot.status !== "creator") throw new Error("Asmo needs administrator membership for reliable member checks.");
+    }) };
+    this.bots.set(chatId, entry);
+    // A failed check is not an observation, so drop it and re-check on the next refresh.
+    entry.promise.catch(() => { if (this.bots.get(chatId) === entry) this.bots.delete(chatId); });
+    return entry.promise;
+  }
+
+  private memberRole(scope: Scope, userId: string): Promise<"manager" | "member" | null> {
+    const key = `${scope.id}:${userId}`;
+    const cached = this.members.get(key);
+    if (cached?.promise) return cached.promise;
+    if (cached?.role !== undefined && Date.now() - cached.at < memberTtlMs) return Promise.resolve(cached.role);
+    const entry: MemberEntry = cached ?? { at: 0 };
+    entry.promise = this.limited(async () => {
+      const member = await this.api.getChatMember(scope.chatId, Number(userId));
+      return ["creator", "administrator"].includes(member.status) ? "manager" : member.status === "member" || (member.status === "restricted" && member.is_member) ? "member" : null;
+    });
+    if (!cached) this.members.set(key, entry);
+    if (this.members.size > maxMemberEntries) {
+      const oldest = this.members.keys().next().value;
+      if (oldest !== undefined) this.members.delete(oldest);
+    }
+    entry.promise.then(role => { entry.role = role; entry.at = Date.now(); }).catch(() => { /* keep the last-known observation for the stale fallback */ }).finally(() => { delete entry.promise; });
+    return entry.promise;
   }
 }

@@ -70,7 +70,12 @@ export function createHttpServer(app: HttpApplication) {
         if (!update) { json(res, 200, { kind: "ignored" }); return; }
         if ("userId" in update && update.userId && update.kind !== "membership") {
           const scope = await app.store.resolveChat(app.bot.id, update.chatId);
-          if (scope) await app.authority?.refresh(scope, update.userId);
+          // Ingest rechecks the stored membership, so a failed refresh must not fail the
+          // webhook: a non-2xx response makes Telegram redeliver the update and deepen the load.
+          if (scope) {
+            try { await app.authority?.refresh(scope, update.userId); }
+            catch { console.error("Membership refresh failed before intake. Ingest continues with the last-known membership."); }
+          }
         }
         if (app.files && update.kind === "message") {
           const scope = await app.store.resolveChat(app.bot.id, update.chatId);

@@ -150,6 +150,45 @@ describe("Responses provider boundary", () => {
     await expect(model(async () => response([message()], "completed", { input_tokens: 10, output_tokens: 2, output_tokens_details: { reasoning_tokens: 3 } })).turn(input(), signal())).rejects.toThrow("inconsistent token usage");
   });
 
+  it("treats overflow as truncation instead of task failure for large tool results, memories, or attachments", async () => {
+    let capturedBody: Record<string, unknown> = {};
+    const provider = model(async (_url, request) => {
+      capturedBody = JSON.parse(String(request?.body));
+      return response();
+    });
+
+    // 1. Tool result exceeding request cap
+    const largeHistory: Transcript[] = [
+      { role: "assistant", content: [{ type: "tool_use", id: "call-1", name: "github_read_issues", input: { repository: "acme/checkout" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call-1", content: "x".repeat(120_000), is_error: false }] },
+    ];
+    const turn1 = await provider.turn(input(largeHistory), signal());
+    expect(turn1.outcome).toBe("complete");
+    expect(Buffer.byteLength(JSON.stringify(capturedBody))).toBeLessThanOrEqual(100_000);
+    expect(turn1.limitations.some(l => l.includes("truncated"))).toBe(true);
+
+    // 2. 25 large memories
+    const memories = Array.from({ length: 25 }, (_, i) => ({
+      id: `mem-${i}`, scopeId: "scope-1", content: `m-${i}-`.padEnd(4000, "x"), evidenceIds: [], revision: 1, state: "active" as const, authorId: "person-1", correctedByHuman: false,
+    }));
+    const turn2 = await provider.turn({ ...input(), memories }, signal());
+    expect(turn2.outcome).toBe("complete");
+    expect(Buffer.byteLength(JSON.stringify(capturedBody))).toBeLessThanOrEqual(100_000);
+    expect(turn2.limitations.some(l => l.includes("truncated"))).toBe(true);
+
+    // 3. Multiple large attachments
+    const sources = [
+      { id: "source-1", scopeId: "scope-1", text: "s".repeat(32_000), revision: 1, messageId: 1, capturedAt: 10, kind: "text_file" as const },
+      ...Array.from({ length: 3 }, (_, i) => ({
+        id: `src-${i + 2}`, scopeId: "scope-1", text: "s".repeat(32_000), revision: 1, messageId: i + 2, capturedAt: 11 + i, kind: "text_file" as const,
+      })),
+    ];
+    const turn3 = await provider.turn({ ...input(), sources }, signal());
+    expect(turn3.outcome).toBe("complete");
+    expect(Buffer.byteLength(JSON.stringify(capturedBody))).toBeLessThanOrEqual(100_000);
+    expect(turn3.limitations.some(l => l.includes("truncated"))).toBe(true);
+  });
+
   it("does not retry or leak HTTP/network errors and aborts before dispatch", async () => {
     let attempts = 0;
     await expect(model(async () => { attempts++; return new Response(JSON.stringify({ error: { message: "fixture-secret-never-live" } }), { status: 429 }); }).turn(input(), signal())).rejects.toThrow(/^openai request failed \(status 429\)$/);
