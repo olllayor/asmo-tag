@@ -34,6 +34,15 @@ describe("Conversation controls", () => {
   });
 });
 
+describe("Secret comparison timing", () => {
+  it("compares digests so a different length is not an early exit", () => {
+    expect(equalSecret("synthetic-secret", "synthetic-secret")).toBe(true);
+    expect(equalSecret("synthetic-secret", "synthetic-other")).toBe(false);
+    expect(equalSecret("synthetic-secret", "shorter")).toBe(false);
+    expect(equalSecret("", "")).toBe(true);
+  });
+});
+
 describe("Telegram identity and intake boundaries", () => {
   it("verifies signed identity including the signature field and rejects tampering", () => {
     const initData = signed({ auth_date: String(now / 1000), user, signature: "synthetic-signature", start_param: "t_synthetic" });

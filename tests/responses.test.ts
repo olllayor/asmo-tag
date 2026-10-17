@@ -189,6 +189,44 @@ describe("Responses provider boundary", () => {
     expect(turn3.limitations.some(l => l.includes("truncated"))).toBe(true);
   });
 
+  it("trims member-sized instruction and accumulated steers instead of wedging the task", async () => {
+    let capturedBody: Record<string, unknown> = {};
+    const provider = model(async (_url, request) => { capturedBody = JSON.parse(String(request?.body)); return response(); });
+    const instruction = "欧".repeat(16_000);
+    const history: Transcript[] = [
+      { role: "user", content: [{ type: "text", text: instruction }] },
+      ...Array.from({ length: 8 }, (_, i) => ({ role: "user" as const, content: [{ type: "text" as const, text: `Steer ${i}: ` + "欧".repeat(4_000) }] })),
+    ];
+    const turn = await provider.turn({ ...input(history), task: { ...input().task, instruction } }, signal());
+    expect(turn.outcome).toBe("complete");
+    expect(Buffer.byteLength(JSON.stringify(capturedBody))).toBeLessThanOrEqual(100_000);
+    expect(turn.limitations.some(line => line.includes("truncated"))).toBe(true);
+  });
+
+  it("drops the oldest message text when accumulated steers alone exceed the request limit", async () => {
+    let capturedBody: Record<string, unknown> = {};
+    const provider = model(async (_url, request) => { capturedBody = JSON.parse(String(request?.body)); return response(); });
+    const history: Transcript[] = Array.from({ length: 150 }, (_, i) => ({ role: "user" as const, content: [{ type: "text" as const, text: `Steer ${i}: ` + "欧".repeat(4_000) }] }));
+    const turn = await provider.turn(input(history), signal());
+    expect(turn.outcome).toBe("complete");
+    expect(Buffer.byteLength(JSON.stringify(capturedBody))).toBeLessThanOrEqual(100_000);
+    expect(turn.limitations.some(line => line.includes("truncated"))).toBe(true);
+  });
+
+  it("trims history text that carries stored provider state without a state mismatch", async () => {
+    let capturedBody: Record<string, unknown> = {};
+    const provider = model(async (_url, request) => { capturedBody = JSON.parse(String(request?.body)); return response(); });
+    const first = await model(async () => response([message("欧".repeat(5_000))])).turn(input(), signal());
+    const pairs: Transcript[] = Array.from({ length: 10 }, (_, i) => ([
+      { role: "assistant" as const, content: [{ type: "tool_use" as const, id: `call-${i}`, name: "github_read_issues" as const, input: { repository: "acme/checkout" } }] },
+      { role: "user" as const, content: [{ type: "tool_result" as const, tool_use_id: `call-${i}`, content: "x".repeat(30_000), is_error: false }] },
+    ])).flat();
+    const turn = await provider.turn(input([first.message, ...pairs]), signal());
+    expect(turn.outcome).toBe("complete");
+    expect(Buffer.byteLength(JSON.stringify(capturedBody))).toBeLessThanOrEqual(100_000);
+    expect(turn.limitations.some(line => line.includes("truncated"))).toBe(true);
+  });
+
   it("does not retry or leak HTTP/network errors and aborts before dispatch", async () => {
     let attempts = 0;
     await expect(model(async () => { attempts++; return new Response(JSON.stringify({ error: { message: "fixture-secret-never-live" } }), { status: 429 }); }).turn(input(), signal())).rejects.toThrow(/^openai request failed \(status 429\)$/);

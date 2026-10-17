@@ -1,5 +1,6 @@
 import { createHmac, randomBytes, randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { request as httpRequest } from "node:http";
@@ -86,6 +87,16 @@ describe("HTTP auth and scoped command boundary against SQLite", () => {
     expect((await fetch(`${url}/api/session`, { headers: { ...auth, Origin: url } })).status).toBe(200);
     expect((await fetch(`${url}/telegram/webhook`, { method: "POST", body: "{}" })).status).toBe(401);
   });
+  it("serves the Mini App with a restrictive content security policy", { skip: !existsSync("web/dist/index.html") }, async () => {
+    const page = await fetch(`${url}/`);
+    expect(page.status).toBe(200);
+    expect(page.headers.get("content-type")).toBe("text/html; charset=utf-8");
+    // Exact directive values, so an added permissive source cannot pass as a substring.
+    const directives = Object.fromEntries((page.headers.get("content-security-policy") ?? "").split(";").map(part => { const [name, ...values] = part.trim().split(/\s+/); return [name, values.join(" ")]; }));
+    expect(directives["default-src"]).toBe("'none'");
+    expect(directives["script-src"]).toBe("'self' https://telegram.org");
+    expect(directives["frame-ancestors"]).toBe("'self' https://web.telegram.org https://*.telegram.org");
+  });
   it("links Notion through authenticated HTTP and creates only the verified scope grant", async () => {
     const token = "123456:synthetic";
     const config = readConfig({ ASMO_MODE: "live", ASMO_DATABASE_PATH: join(directory, "http.sqlite"), TELEGRAM_BOT_TOKEN: token, TELEGRAM_WEBHOOK_SECRET: "synthetic-webhook-secret", OPENAI_API_KEY: "synthetic", ASMO_MODEL: "synthetic", ASMO_CACHED_INPUT_USD_PER_MILLION: "0.1", ASMO_INPUT_USD_PER_MILLION: "1", ASMO_OUTPUT_USD_PER_MILLION: "1", ASMO_MODEL_RESERVE_MICROS: "200000" });
@@ -112,7 +123,10 @@ describe("HTTP auth and scoped command boundary against SQLite", () => {
       const link = await started.json() as { authorizationUrl: string };
       const state = new URL(link.authorizationUrl).searchParams.get("state")!;
       const callback = `${base}/connectors/notion/callback?state=${encodeURIComponent(state)}&code=mock-code`;
-      expect((await fetch(callback)).status).toBe(200);
+      const page = await fetch(callback);
+      expect(page.status).toBe(200);
+      expect(page.headers.get("content-security-policy")).toContain("default-src 'none'");
+      expect(page.headers.get("referrer-policy")).toBe("no-referrer");
       expect((await fetch(callback)).status).toBe(403);
       expect(calls).toBe(1);
       const listing = await fetch(`${base}/api/integrations?scope=${scope.id}`, { headers: signed(101) });

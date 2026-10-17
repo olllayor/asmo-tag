@@ -224,6 +224,8 @@ export const workspaceViewSchema = z.object({
   routines: z.array(routineSchema),
   grants: z.array(grantSchema),
   usage: z.object({ heldMicros: micros, spentMicros: micros, simulated: z.boolean() }),
+  // True when the scope holds more task records than one view response carries.
+  limited: z.boolean(),
 });
 export type WorkspaceView = z.infer<typeof workspaceViewSchema>;
 
@@ -248,7 +250,8 @@ export const commandSchema = z.discriminatedUnion('kind', [
     expectedRevision: z.number().int().positive(),
     content: z.string().min(1).max(4000),
   }),
-  z.object({ kind: z.literal('set_memory'), memoryId: id, state: z.enum(['active', 'rejected', 'invalidated']) }),
+  // The store checks expectedRevision itself, so stale callers get a denial receipt instead of a parse error.
+  z.object({ kind: z.literal('set_memory'), memoryId: id, state: z.enum(['active', 'rejected', 'invalidated']), expectedRevision: z.number().int().positive().optional() }),
   z.object({ kind: z.literal('forget_sources'), sourceIds: z.array(id).min(1).max(100) }),
   z.object({
     kind: z.literal('create_routine'),

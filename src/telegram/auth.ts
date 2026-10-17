@@ -1,9 +1,10 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 
+// Hash both sides to fixed 32 byte digests before timingSafeEqual so the cost never
+// depends on where the inputs first differ or on their lengths being equal.
 export function equalSecret(left: string, right: string): boolean {
-  const a = Buffer.from(left), b = Buffer.from(right);
-  return a.length === b.length && timingSafeEqual(a, b);
+  return timingSafeEqual(createHash("sha256").update(left).digest(), createHash("sha256").update(right).digest());
 }
 
 export function validateInitData(initData: string, botToken: string, now = Date.now()): string {
