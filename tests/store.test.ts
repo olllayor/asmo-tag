@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { nextWallClockInstant, wallClockInstant, type Command, type Job, type NormalizedUpdate, type Scope, type Seed, type Store, type StoreOptions, type Turn } from "../src/core.js";
 import { openStore } from "../src/store/index.js";
 import { createResponsesModel } from "../src/providers/responses.js";
-import { contextCoverageLimitation } from "../src/conversation.js";
+import { boundedCaptureLimitation, contextCoverageLimitation } from "../src/conversation.js";
 
 
 type ModelJob = Extract<Job, { kind: "model" }>;
@@ -324,7 +324,9 @@ describe("SQLite task lifecycle with simulated integrations", () => {
   it("selects a recent bounded context window with the current attachment and chronological presentation", async () => {
     await store.ingest(message("PRIVATE OTHER GROUP HISTORY", 700, { chatId: otherScope.chatId, userId: "other" }));
     for (let index = 0; index < 320; index += 1) {
-      now += 1;
+      // A real group spreads this stream over minutes. Step past the passive flood window
+      // every 60 captures so this test exercises the source window, not the flood cap.
+      now += index > 0 && index % 60 === 0 ? 60_001 : 1;
       await store.ingest(message(index === 0 ? "OLDEST SCOPED FACT" : index === 319 ? "RECENT SCOPED FACT" : `Recent-window fixture ${index}`, 10_000 + index));
     }
     now += 1;
@@ -356,7 +358,8 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     await start("Unrelated older investigation");
     await completeRead("UNRELATED OLDER TOOL RECEIPT");
     for (let index = 0; index < 305; index += 1) {
-      now += 1;
+      // Keep each burst under the passive flood window; the source window is the subject.
+      now += index > 0 && index % 60 === 0 ? 60_001 : 1;
       await store.ingest(message(`Newer unrelated group context ${index}`, 13_000 + index));
     }
     await command({ kind: "steer", taskId: accepted.taskId, text: "Continue the original investigation with its saved receipt" });
@@ -381,7 +384,8 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     await command({ kind: "remember", content: "A saved older fact remains useful", evidenceIds: [evidence.id], candidate: false });
     await command({ kind: "cancel", taskId: initialTask });
     for (let index = 0; index < 305; index += 1) {
-      now += 1;
+      // Keep each burst under the passive flood window; the source window is the subject.
+      now += index > 0 && index % 60 === 0 ? 60_001 : 1;
       await store.ingest(message(`Later memory-window context ${index}`, 16_000 + index));
     }
     await start("Use the active saved fact with its evidence reference");
@@ -1246,5 +1250,215 @@ describe("Held job release (L20)", () => {
 
     await store.close();
     rmSync(directory, { recursive: true, force: true });
+  });
+});
+
+describe("Passive ingestion caps (L20)", () => {
+  let directory: string;
+  let now: number;
+  let updateId: number;
+  let deliveryMessageId: number;
+  let store: Store;
+  let options: StoreOptions & { databasePath: string };
+  let scope: Scope;
+  let seed: Seed;
+
+  beforeEach(() => {
+    directory = mkdtempSync(join(tmpdir(), "asmo-ingest-caps-"));
+    now = 1_700_000_000_000;
+    updateId = 0;
+    deliveryMessageId = 5_000_000;
+    const workspaceId = randomUUID();
+    scope = { id: randomUUID(), workspaceId, kind: "group", chatId: `-${randomUUID()}`, ownerId: null, name: "Ingestion caps", active: true, workspacePublic: false, timezone: "UTC", policyRevision: 1, collectedSince: now - 1000, budgetMicros: 100_000 };
+    seed = { botId: randomUUID(), workspaceId, name: "Ingestion caps", ownerId: "owner", budgetMicros: 200_000, scopes: [scope], memberships: [{ scopeId: scope.id, userId: "member", role: "member" }], grants: [] };
+  });
+  afterEach(async () => { await store?.close(); rmSync(directory, { recursive: true, force: true }); });
+
+  // Small limits keep each behavior visible. Tests pass only the caps they exercise and let
+  // the rest fall back to the production defaults.
+  async function launch(overrides: Partial<StoreOptions> = {}): Promise<void> {
+    options = { databasePath: join(directory, "caps.sqlite"), modelReserveMicros: 1000, maxOutputTokens: 2000, maxTurns: 12, taskBudgetMicros: 20_000, leaseMs: 10_000, simulated: true, clock: () => now, ...overrides };
+    store = await openStore(options);
+    await store.seed(seed);
+  }
+  function message(text: string, messageId: number, extra: Partial<Extract<NormalizedUpdate, { kind: "message" }>> = {}): Extract<NormalizedUpdate, { kind: "message" }> {
+    return { kind: "message", botId: seed.botId, updateId: ++updateId, chatId: scope.chatId, userId: "member", messageId, topicId: null, text, mentioned: false, replyTo: null, edited: false, ...extra };
+  }
+  function turn(text = "Fixture result", extra: Partial<Turn> = {}): Turn {
+    return { message: { role: "assistant", content: [{ type: "text", text }] }, usage: { inputTokens: 30, outputTokens: 20, costMicros: 1000, simulated: true, pricingRevision: "fixture-v1" }, requestId: randomUUID(), outcome: "complete", sourceIds: [], limitations: [], ...extra };
+  }
+  async function claimModel(): Promise<ModelJob> {
+    for (;;) {
+      const job = await store.claim("caps-worker");
+      if (!job) throw new Error("Expected a model job");
+      if (job.kind === "delivery") { await store.finishDelivery(job, ++deliveryMessageId); continue; }
+      if (job.kind === "model") return job;
+      throw new Error(`Unexpected ${job.kind} job`);
+    }
+  }
+  function queryAll<T>(sql: string, parameters: (string | number)[] = []): T[] {
+    const db = new DatabaseSync(options.databasePath);
+    try { return db.prepare(sql).all(...parameters) as T[]; }
+    finally { db.close(); }
+  }
+  function storedPassive(): string[] {
+    return queryAll<{ text: string }>("SELECT json_extract(data,'$.text') AS text FROM sources WHERE workspace_id=? AND scope_id=? AND json_extract(data,'$.kind') IN ('message','text_file') AND deleted=0 ORDER BY CAST(json_extract(data,'$.capturedAt') AS INTEGER),id", [seed.workspaceId, scope.id]).map(row => row.text);
+  }
+  function captureBoundEvents(kind: string): { pruned?: number; windowMs?: number; maxCaptures?: number }[] {
+    return queryAll<{ detail: string }>("SELECT json_extract(data,'$.detail') AS detail FROM events WHERE workspace_id=? AND json_extract(data,'$.kind')=?", [seed.workspaceId, kind]).map(row => JSON.parse(row.detail) as { pruned?: number; windowMs?: number; maxCaptures?: number });
+  }
+
+  it("bounds passive captures at the flood cap and still accepts a mention during the flood", async () => {
+    await launch({ passiveFloodWindowMs: 1000, passiveFloodMaxCaptures: 3, passiveSourceLimitPerScope: 500 });
+    for (let index = 0; index < 3; index += 1) {
+      now += 1;
+      expect((await store.ingest(message(`Passive burst ${index}`, 100 + index))).kind).toBe("ignored");
+    }
+    now += 1;
+    const skippedUpdate = message("Passive burst 3", 103);
+    expect(await store.ingest(skippedUpdate)).toEqual({ kind: "ignored", message: "Passive capture skipped: flood cap reached." });
+    const boundedAt = now;
+    now += 1;
+    expect((await store.ingest(message("Passive burst 4", 104))).kind).toBe("ignored");
+    // A retried update stays deduplicated; retrying cannot push past the cap.
+    expect((await store.ingest(skippedUpdate)).kind).toBe("duplicate");
+    expect(storedPassive()).toEqual(["Passive burst 0", "Passive burst 1", "Passive burst 2"]);
+    expect(queryAll<{ count: number }>("SELECT count(*) AS count FROM messages WHERE workspace_id=? AND scope_id=? AND message_id IN (103,104)", [seed.workspaceId, scope.id])[0]?.count).toBe(0);
+    // One disclosure covers both skips inside the same window.
+    const disclosures = captureBoundEvents("passive_flood_skipped");
+    expect(disclosures).toHaveLength(1);
+    expect(disclosures[0]).toMatchObject({ windowMs: 1000, maxCaptures: 3 });
+    // A mention is not pure passive: it starts a task and is captured during the flood.
+    const mentioned = await store.ingest(message("@asmo_ai_bot summarize the burst", 105, { mentioned: true }));
+    expect(mentioned.kind).toBe("accepted");
+    if (!mentioned.taskId) throw new Error("Task request missing");
+    expect(storedPassive()).toContain("@asmo_ai_bot summarize the burst");
+    expect((await store.task(scope.id, "member", mentioned.taskId)).sources.map(source => source.text)).toContain("@asmo_ai_bot summarize the burst");
+    expect((await store.view(scope.id, "member")).scope.captureBoundedAt).toBe(boundedAt);
+  });
+
+  it("resumes passive capture after the flood window passes", async () => {
+    await launch({ passiveFloodWindowMs: 1000, passiveFloodMaxCaptures: 2, passiveSourceLimitPerScope: 500 });
+    now += 1;
+    await store.ingest(message("Before flood 0", 200));
+    now += 1;
+    await store.ingest(message("Before flood 1", 201));
+    now += 1;
+    const skipped = await store.ingest(message("Skipped at the cap", 202));
+    expect(skipped.message).toBe("Passive capture skipped: flood cap reached.");
+    expect(storedPassive()).not.toContain("Skipped at the cap");
+    now += 1001;
+    expect(await store.ingest(message("After the window", 203))).toEqual({ kind: "ignored" });
+    expect(storedPassive()).toContain("After the window");
+  });
+
+  it("prunes the oldest uncited messages and keeps the newest under the retention cap", async () => {
+    await launch({ passiveSourceLimitPerScope: 5, passiveFloodMaxCaptures: 100, passiveFloodWindowMs: 1000 });
+    for (let index = 0; index < 8; index += 1) {
+      now += 1;
+      await store.ingest(message(`Retention message ${index}`, 300 + index));
+    }
+    expect(storedPassive()).toEqual(["Retention message 3", "Retention message 4", "Retention message 5", "Retention message 6", "Retention message 7"]);
+    expect(queryAll<{ count: number }>("SELECT count(*) AS count FROM messages WHERE workspace_id=? AND scope_id=? AND message_id IN (300,301,302)", [seed.workspaceId, scope.id])[0]?.count).toBe(0);
+    const pruned = captureBoundEvents("passive_sources_pruned");
+    expect(pruned).toHaveLength(1);
+    expect(pruned[0]?.pruned).toBe(1);
+  });
+
+  it("keeps task-linked and memory-cited sources while pruning only unpinned drops", async () => {
+    await launch({ passiveSourceLimitPerScope: 5, passiveFloodMaxCaptures: 100, passiveFloodWindowMs: 1000 });
+    const request = await store.ingest(message("@asmo_ai_bot draft the release note", 400, { mentioned: true }));
+    expect(request.kind).toBe("accepted");
+    now += 1;
+    expect((await store.ingest(message("/remember the cohort stays small", 401))).kind).toBe("accepted");
+    for (let index = 0; index < 6; index += 1) {
+      now += 1001;
+      await store.ingest(message(`Unpinned message ${index}`, 410 + index));
+    }
+    const survivors = storedPassive();
+    expect(survivors).toContain("@asmo_ai_bot draft the release note");
+    expect(survivors).toContain("/remember the cohort stays small");
+    expect(survivors.filter(text => text.startsWith("Unpinned message"))).toEqual(["Unpinned message 3", "Unpinned message 4", "Unpinned message 5"]);
+    const pruned = captureBoundEvents("passive_sources_pruned");
+    expect(pruned.reduce((total, event) => total + (event.pruned ?? 0), 0)).toBe(3);
+  });
+
+  it("pins reservation sources against pruning until the reservation settles", async () => {
+    await launch({ passiveSourceLimitPerScope: 5, passiveFloodMaxCaptures: 100, passiveFloodWindowMs: 1000 });
+    for (let index = 0; index < 3; index += 1) {
+      now += 1;
+      await store.ingest(message(`Pinned context ${index}`, 500 + index));
+    }
+    now += 1;
+    const request = await store.ingest(message("@asmo_ai_bot use the pinned context", 510, { mentioned: true }));
+    if (!request.taskId) throw new Error("Task request missing");
+    const model = await claimModel();
+    expect(model.input.sources.map(source => source.text)).toContain("Pinned context 0");
+    // The live reservation pins the model window, so overflow captures are pruned first.
+    for (let index = 0; index < 3; index += 1) {
+      now += 1;
+      await store.ingest(message(`Overflow message ${index}`, 520 + index));
+    }
+    const pinned = storedPassive();
+    expect(pinned).toContain("Pinned context 0");
+    expect(pinned).toContain("Pinned context 1");
+    expect(pinned).toContain("Pinned context 2");
+    // Once the reservation settles, later captures prune the previously pinned messages
+    // oldest-first until they are gone.
+    await store.finishModel(model, turn("Settled answer"));
+    for (let index = 0; index < 3; index += 1) {
+      now += 1;
+      await store.ingest(message(`After the reservation ${index}`, 530 + index));
+    }
+    const released = storedPassive();
+    expect(released).not.toContain("Pinned context 0");
+    expect(released).not.toContain("Pinned context 1");
+    expect(released).not.toContain("Pinned context 2");
+    expect(released).toContain("After the reservation 2");
+  });
+
+  it("handles edits and replies to a pruned message with the existing ignored semantics", async () => {
+    await launch({ passiveSourceLimitPerScope: 3, passiveFloodMaxCaptures: 100, passiveFloodWindowMs: 1000 });
+    for (let index = 0; index < 5; index += 1) {
+      now += 1;
+      await store.ingest(message(`Prunable message ${index}`, 600 + index));
+    }
+    expect(storedPassive()).toEqual(["Prunable message 2", "Prunable message 3", "Prunable message 4"]);
+    now += 1;
+    expect(await store.ingest(message("Edited after pruning", 600, { edited: true }))).toEqual({ kind: "ignored", message: "Edit stored as context only. Reply to steer." });
+    now += 1;
+    expect(await store.ingest(message("What did message 600 say?", 900, { replyTo: 600 }))).toEqual({ kind: "ignored" });
+    expect(storedPassive()).toContain("What did message 600 say?");
+  });
+
+  it("prunes a message's text_file sibling together with it", async () => {
+    await launch({ passiveSourceLimitPerScope: 2, passiveFloodMaxCaptures: 100, passiveFloodWindowMs: 1000 });
+    await store.ingest(message("Attachment carrier", 700, { file: { name: "notes.txt", text: "FILE BODY" } }));
+    now += 1;
+    await store.ingest(message("Newer plain message", 701));
+    now += 1;
+    await store.ingest(message("Newest plain message", 702));
+    expect(storedPassive()).toEqual(["Newer plain message", "Newest plain message"]);
+    expect(queryAll<{ count: number }>("SELECT count(*) AS count FROM sources WHERE workspace_id=? AND scope_id=? AND json_extract(data,'$.kind')='text_file'", [seed.workspaceId, scope.id])[0]?.count).toBe(0);
+    expect(queryAll<{ count: number }>("SELECT count(*) AS count FROM messages WHERE workspace_id=? AND scope_id=? AND message_id=700", [seed.workspaceId, scope.id])[0]?.count).toBe(0);
+  });
+
+  it("discloses bounded capture on a completed task result after a prune", async () => {
+    await launch({ passiveSourceLimitPerScope: 2, passiveFloodMaxCaptures: 100, passiveFloodWindowMs: 1000 });
+    for (let index = 0; index < 3; index += 1) {
+      now += 1;
+      await store.ingest(message(`Context before prune ${index}`, 800 + index));
+    }
+    expect(storedPassive()).toHaveLength(2);
+    now += 1;
+    const request = await store.ingest(message("@asmo_ai_bot answer from bounded context", 810, { mentioned: true }));
+    if (!request.taskId) throw new Error("Task request missing");
+    const model = await claimModel();
+    const coverage = contextCoverageLimitation(scope.collectedSince);
+    await store.finishModel(model, turn("Answer with disclosure", { limitations: [coverage] }));
+    const result = (await store.task(scope.id, "member", request.taskId)).task.result;
+    expect(result?.text).toBe("Answer with disclosure");
+    expect(result?.limitations).toContain(coverage);
+    expect(result?.limitations).toContain(boundedCaptureLimitation);
   });
 });

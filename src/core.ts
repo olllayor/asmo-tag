@@ -17,6 +17,7 @@ export const scopeSchema = z.object({
   policyRevision: z.number().int().positive(),
   collectedSince: z.number(),
   budgetMicros: micros,
+  captureBoundedAt: z.number().nullable().optional(),
 });
 export type Scope = z.infer<typeof scopeSchema>;
 export const sourceSchema = z.object({
@@ -392,6 +393,9 @@ export type StoreOptions = {
   leaseMs: number;
   simulated: boolean;
   clock?: () => number;
+  passiveSourceLimitPerScope?: number;
+  passiveFloodWindowMs?: number;
+  passiveFloodMaxCaptures?: number;
 };
 
 // Routine scheduling runs on wall-clock intent. A routine stores an IANA timezone and a

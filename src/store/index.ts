@@ -4,7 +4,7 @@ import type { Db } from "./sql.js";
 import { connectD1Database, inD1Transaction, isD1Database } from "./d1.js";
 import type { D1Connection, D1Database } from "./d1.js";
 import { z } from "zod";
-import { conversationAnswer, greetingReply } from "../conversation.js";
+import { boundedCaptureLimitation, conversationAnswer, greetingReply } from "../conversation.js";
 import {
   approvalSchema, commandSchema, effectSchema, eventSchema, grantSchema, memorySchema,
   nextWallClockInstant, routineSchema, scopeSchema, sourceSchema, taskSchema, taskViewSchema, transcriptSchema,
@@ -79,6 +79,13 @@ const deferredClaimMs = 250;
 const heldReleaseBatchSize = 20;
 const heldReleaseBackoffMs = [1_000, 5_000, 30_000, 120_000];
 const scopeSourceWindowLimit = 300;
+// Passive capture bounds. Sources over the retention cap are pruned oldest-first, and pure
+// passive messages stop being captured once a scope has captured this many in the window.
+// Both are overridable per store through StoreOptions.
+const passiveSourceLimitPerScope = 1000;
+const passiveFloodWindowMs = 60_000;
+const passiveFloodMaxCaptures = 60;
+const passivePruneBatchSize = 200;
 
 async function rows<T>(db: Db, sql: string, parameters: unknown[], schema: z.ZodType<T>): Promise<T[]> {
   const result = await db.query<Record<string, unknown>>(sql, parameters);
@@ -176,10 +183,16 @@ class SQLiteStore implements Store {
   readonly connection: Connection | D1Connection;
   readonly options: StoreOptions;
   readonly now: () => number;
+  readonly passiveCaps: { sourceLimit: number; floodWindowMs: number; floodMaxCaptures: number };
   constructor(options: StoreOptions, connection: Connection | D1Connection) {
     this.options = options;
     this.now = options.clock ?? Date.now;
     this.connection = connection;
+    this.passiveCaps = {
+      sourceLimit: options.passiveSourceLimitPerScope ?? passiveSourceLimitPerScope,
+      floodWindowMs: options.passiveFloodWindowMs ?? passiveFloodWindowMs,
+      floodMaxCaptures: options.passiveFloodMaxCaptures ?? passiveFloodMaxCaptures,
+    };
   }
   // Dispatches to the D1 gate without touching ./connection.js (which imports
   // node:sqlite/node:fs and must never load on the edge), and to the full
@@ -657,17 +670,31 @@ class SQLiteStore implements Store {
       return { kind: "ignored", message: "Edit stored as context only. Reply to steer." };
     }
     if (existing) return { kind: "duplicate", ...(existing.task_id ? { taskId: existing.task_id } : {}) };
-    const source: Source = { id: uuid(), scopeId: scope.id, text: update.text, revision: 1, messageId: update.messageId, capturedAt: this.now(), kind: "message" };
-    await db.query("INSERT INTO sources(workspace_id,scope_id,id,data) VALUES($1,$2,$3,$4)", [scope.workspaceId, scope.id, source.id, JSON.stringify(source)]);
-    if (update.file) {
-      const file: Source = { ...source, id: uuid(), text: update.file.text, kind: "text_file" };
-      await db.query("INSERT INTO sources(workspace_id,scope_id,id,data) VALUES($1,$2,$3,$4)", [scope.workspaceId, scope.id, file.id, JSON.stringify(file)]);
-    }
+    // Classification reads only. The reply lookup, address checks, file presence and command
+    // match are computed before capture so the flood gate sees the same verdict the receipt
+    // will, and a skipped capture leaves no source or message row behind.
+    const now = this.now();
     const reply = update.replyTo === null ? null : (await rows(db, "SELECT task_id,source_id FROM messages WHERE workspace_id=$workspace AND scope_id=$1 AND message_id=$2 ORDER BY (chat_id=$3) DESC LIMIT 1", [scope.id, update.replyTo, update.chatId], z.object({ task_id: z.string().nullable(), source_id: z.string().nullable() })))[0];
     const linked = reply?.task_id ?? null;
     const addressed = update.mentioned || scope.kind === "dm" || reply?.source_id === null;
     const greeting = !linked && !update.file && addressed ? greetingReply(update.text) : null;
     const match = /^\/(\w+)(?:@\w+)?(?:\s+([\s\S]*))?$/.exec(update.text.trim());
+    // Pure passive: not a task reply, not addressed, no parsed file, no command match.
+    const passive = !linked && !addressed && !update.file && !match;
+    if (passive) {
+      const recent = first(await rows(db, "SELECT count(*) AS count FROM sources WHERE workspace_id=$workspace AND scope_id=$1 AND data->>'kind' IN ('message','text_file') AND CAST(data->>'capturedAt' AS INTEGER) > $2", [scope.id, now - this.passiveCaps.floodWindowMs], z.object({ count: z.coerce.number().int() }))).count;
+      if (recent >= this.passiveCaps.floodMaxCaptures) {
+        // The updates row still records this attempt, so a retried update is a duplicate.
+        await this.noteCaptureBound(db, scope, now, "passive_flood_skipped", { windowMs: this.passiveCaps.floodWindowMs, maxCaptures: this.passiveCaps.floodMaxCaptures });
+        return { kind: "ignored", message: "Passive capture skipped: flood cap reached." };
+      }
+    }
+    const source: Source = { id: uuid(), scopeId: scope.id, text: update.text, revision: 1, messageId: update.messageId, capturedAt: now, kind: "message" };
+    await db.query("INSERT INTO sources(workspace_id,scope_id,id,data) VALUES($1,$2,$3,$4)", [scope.workspaceId, scope.id, source.id, JSON.stringify(source)]);
+    if (update.file) {
+      const file: Source = { ...source, id: uuid(), text: update.file.text, kind: "text_file" };
+      await db.query("INSERT INTO sources(workspace_id,scope_id,id,data) VALUES($1,$2,$3,$4)", [scope.workspaceId, scope.id, file.id, JSON.stringify(file)]);
+    }
     let receipt: Receipt = { kind: "ignored" };
     if (match) {
       const name = match[1];
@@ -699,7 +726,41 @@ class SQLiteStore implements Store {
       receipt = await this.commandIn(db, scope, { scopeId: scope.id, userId: update.userId, key: `telegram:${update.botId}:${update.updateId}`, command });
     }
     await db.query("INSERT INTO messages(workspace_id,scope_id,chat_id,message_id,task_id,source_id) VALUES($1,$2,$3,$4,$5,$6)", [scope.workspaceId, scope.id, update.chatId, update.messageId, receipt.taskId ?? null, source.id]);
+    await this.prunePassiveSources(db, scope, now);
     return receipt;
+  }
+  // Retention trims the oldest passive messages when a scope stores more than its cap.
+  // Ineligible rows stay: sources a task owns or a message row links to a task, evidence of a
+  // stored memory, and sources pinned by a live reservation. Each pruned message takes its
+  // text-file sibling with it, so no orphan file row survives. The sweep is bounded per call.
+  async prunePassiveSources(db: Db, scope: Scope, now: number): Promise<void> {
+    const stored = first(await rows(db, "SELECT count(*) AS count FROM sources WHERE workspace_id=$workspace AND scope_id=$1 AND data->>'kind' IN ('message','text_file') AND NOT deleted", [scope.id], z.object({ count: z.coerce.number().int() }))).count;
+    if (stored <= this.passiveCaps.sourceLimit) return;
+    const overage = Math.min(passivePruneBatchSize, stored - this.passiveCaps.sourceLimit);
+    const candidates = await rows(db, `SELECT s.id AS id FROM sources s
+      WHERE s.workspace_id=$workspace AND s.scope_id=$1 AND NOT s.deleted AND s.data->>'kind'='message' AND s.task_id IS NULL
+        AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.workspace_id=s.workspace_id AND m.scope_id=s.scope_id AND m.source_id=s.id AND m.task_id IS NOT NULL)
+        AND NOT EXISTS (SELECT 1 FROM memories memory WHERE memory.workspace_id=s.workspace_id AND memory.scope_id=s.scope_id AND EXISTS (SELECT 1 FROM json_each(memory.data->'evidenceIds') WHERE json_each.value=s.id))
+        AND NOT EXISTS (SELECT 1 FROM reservations reservation WHERE reservation.workspace_id=s.workspace_id AND reservation.scope_id=s.scope_id AND reservation.settled=0 AND reservation.expired=0 AND EXISTS (SELECT 1 FROM json_each(reservation.sources) WHERE json_extract(json_each.value,'$.id')=s.id))
+      ORDER BY CAST(s.data->>'capturedAt' AS INTEGER),s.id LIMIT $2`, [scope.id, overage], z.object({ id: z.string() }));
+    if (!candidates.length) return;
+    const prunedIds = candidates.map(candidate => candidate.id);
+    const siblings = await rows(db, `SELECT DISTINCT f.id AS id FROM sources f
+      WHERE f.workspace_id=$workspace AND f.scope_id=$1 AND f.data->>'kind'='text_file'
+        AND EXISTS (SELECT 1 FROM sources s WHERE s.workspace_id=f.workspace_id AND s.scope_id=f.scope_id AND s.data->>'kind'='message'
+          AND s.data->>'messageId'=f.data->>'messageId' AND s.data->>'capturedAt'=f.data->>'capturedAt' AND s.id IN (SELECT value FROM json_each($2)))`, [scope.id, JSON.stringify(prunedIds)], z.object({ id: z.string() }));
+    const doomed = JSON.stringify([...prunedIds, ...siblings.map(sibling => sibling.id)]);
+    await db.query("DELETE FROM messages WHERE workspace_id=$workspace AND scope_id=$1 AND source_id IN (SELECT value FROM json_each($2))", [scope.id, doomed]);
+    await db.query("DELETE FROM sources WHERE workspace_id=$workspace AND scope_id=$1 AND id IN (SELECT value FROM json_each($2))", [scope.id, doomed]);
+    await this.noteCaptureBound(db, scope, now, "passive_sources_pruned", { pruned: prunedIds.length });
+  }
+  // Retention prunes and flood skips are disclosed once per flood window per scope. The same
+  // timestamp throttles both the event log and scope writes, and later task results read it
+  // to state that capture was bounded.
+  async noteCaptureBound(db: Db, scope: Scope, now: number, kind: "passive_sources_pruned" | "passive_flood_skipped", detail: z.infer<typeof eventSchema>["detail"]): Promise<void> {
+    if (scope.captureBoundedAt != null && now - scope.captureBoundedAt < this.passiveCaps.floodWindowMs) return;
+    await event(db, scope, null, null, kind, detail, now);
+    await save(db, "scopes", { ...scope, captureBoundedAt: now });
   }
   async effectAllowed(db: Db, scope: Scope, task: Task, effect: Effect): Promise<boolean> {
     if (!scope.active || !liveStates.has(task.state) || task.revision !== effect.taskRevision || scope.policyRevision !== effect.policyRevision) return false;
@@ -1022,7 +1083,7 @@ class SQLiteStore implements Store {
       const permittedIds = new Set(job.input.sources.map(source => source.id));
       const cited = result.sourceIds.filter(id => permittedIds.has(id));
       const invalidCitations = result.sourceIds.length !== cited.length;
-      const limitations = [...result.limitations, ...(invalidCitations ? ["The provider cited unavailable evidence. Those citations were removed."] : [])];
+      const limitations = [...result.limitations, ...(invalidCitations ? ["The provider cited unavailable evidence. Those citations were removed."] : []), ...(scope.captureBoundedAt != null ? [boundedCaptureLimitation] : [])];
       const completed: Task = { ...progressed, state: result.outcome === "complete" ? "completed" : result.outcome === "needs_input" ? "waiting_for_input" : "failed", result: { text, sourceIds: cited, limitations }, reason: result.outcome === "incomplete" ? "Provider output incomplete. Resume after checking the limit or refusal." : null };
       await save(db, "tasks", completed);
       await event(db, scope, task.id, null, "model_turn_committed", { outcome: result.outcome, sourceIds: cited, turns: completed.turns }, this.now());
@@ -1139,7 +1200,7 @@ class SQLiteStore implements Store {
 }
 
 export async function openStore(options: StoreOptions): Promise<Store> {
-  z.object({ databasePath: z.string().min(1).optional(), modelReserveMicros: z.number().int().positive().max(Number.MAX_SAFE_INTEGER), maxOutputTokens: z.number().int().positive(), maxTurns: z.number().int().positive(), taskBudgetMicros: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER), leaseMs: z.number().int().min(100).max(3_600_000), simulated: z.boolean() }).parse(options);
+  z.object({ databasePath: z.string().min(1).optional(), modelReserveMicros: z.number().int().positive().max(Number.MAX_SAFE_INTEGER), maxOutputTokens: z.number().int().positive(), maxTurns: z.number().int().positive(), taskBudgetMicros: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER), leaseMs: z.number().int().min(100).max(3_600_000), simulated: z.boolean(), passiveSourceLimitPerScope: z.number().int().positive().optional(), passiveFloodWindowMs: z.number().int().positive().optional(), passiveFloodMaxCaptures: z.number().int().positive().optional() }).parse(options);
   assertBackend(options);
   const connection = options.d1
     ? connectD1Database(options.d1)
