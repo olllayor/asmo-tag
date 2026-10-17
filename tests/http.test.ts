@@ -1,5 +1,5 @@
 import { createHmac, randomBytes, randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -30,6 +30,10 @@ describe("HTTP auth and scoped command boundary against SQLite", () => {
   const auth = { Authorization: "Fixture 101" };
   const headers = { ...auth, "Content-Type": "application/json" };
   beforeAll(async () => {
+    if (!existsSync("web/dist/index.html")) {
+      await mkdir("web/dist", { recursive: true });
+      await writeFile("web/dist/index.html", "<!doctype html><html lang=\"en\"><head><title>Asmo</title></head><body>Mini App</body></html>");
+    }
     const workspaceId = randomUUID();
     directory = await mkdtemp(join(tmpdir(), "asmo-http-"));
     store = await openStore({ databasePath: join(directory, "http.sqlite"), modelReserveMicros: 1000, maxOutputTokens: 1024, maxTurns: 4, taskBudgetMicros: 100000, leaseMs: 10000, simulated: true, workspaceIds: [workspaceId] });
@@ -87,7 +91,7 @@ describe("HTTP auth and scoped command boundary against SQLite", () => {
     expect((await fetch(`${url}/api/session`, { headers: { ...auth, Origin: url } })).status).toBe(200);
     expect((await fetch(`${url}/telegram/webhook`, { method: "POST", body: "{}" })).status).toBe(401);
   });
-  it("serves the Mini App with a restrictive content security policy", { skip: !existsSync("web/dist/index.html") }, async () => {
+  it("serves the Mini App with a restrictive content security policy", async () => {
     const page = await fetch(`${url}/`);
     expect(page.status).toBe(200);
     expect(page.headers.get("content-type")).toBe("text/html; charset=utf-8");

@@ -143,10 +143,11 @@ export function createHttpServer(app: HttpApplication) {
         }
         if (url.pathname === "/api/view" && req.method === "GET") {
           const scopeId = z.string().min(1).max(128).parse(url.searchParams.get("scope"));
+          const taskId = z.string().min(1).max(128).nullish().parse(url.searchParams.get("task"));
           const existing = (await app.store.scopes(userId)).find(scope => scope.id === scopeId);
           if (!existing) throw new Error("Access denied.");
           await app.authority?.refresh(existing, userId);
-          json(res, 200, await app.store.view(scopeId, userId)); return;
+          json(res, 200, await app.store.view(scopeId, userId, taskId ?? undefined)); return;
         }
         if (url.pathname === "/api/command" && req.method === "POST") {
           const input = z.object({ scopeId: z.string().min(1).max(128), key: z.string().min(1).max(128), command: commandSchema }).strict().parse(await body(req));

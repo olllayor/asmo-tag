@@ -214,7 +214,7 @@ describe("Memory write policy: evidence, caps, CAS, and terminal invalidation", 
     for (let index = 0; index < 20; index += 1) expect((await command({ kind: "remember", content: `Parked ${index}`, evidenceIds: [], candidate: false })).kind).toBe("accepted");
     const first = (await store.view(scope.id, "member")).memories.find(item => item.state === "candidate");
     if (!first) throw new Error("Candidate missing");
-    expect((await command({ kind: "set_memory", memoryId: first.id, state: "rejected", expectedRevision: first.revision })).kind).toBe("accepted");
+    expect((await command({ kind: "set_memory", memoryId: first.id, state: "rejected", expectedRevision: first.revision }, "manager")).kind).toBe("accepted");
     const overflow = await command({ kind: "remember", content: "Parked overflow", evidenceIds: [], candidate: false });
     expect(overflow.kind).toBe("denied");
     expect(overflow.message).toContain("candidate memory limit");
@@ -227,5 +227,20 @@ describe("Memory write policy: evidence, caps, CAS, and terminal invalidation", 
     if (!pending) throw new Error("Pending memory missing");
     expect((await command({ kind: "correct_memory", memoryId: pending.id, expectedRevision: pending.revision, content: "Corrected while pending" })).kind).toBe("accepted");
     expect((await store.view(scope.id, "member")).memories.find(item => item.id === pending.id)?.state).toBe("candidate");
+  });
+
+  it("denies set_memory rejection by a member while allowing managers", async () => {
+    const candidate = await command({ kind: "remember", content: "To be rejected", evidenceIds: [], candidate: false }, "member");
+    expect(candidate.kind).toBe("accepted");
+    const stored = (await store.view(scope.id, "member")).memories.find(item => item.content === "To be rejected");
+    if (!stored) throw new Error("Stored memory missing");
+
+    const memberReject = await command({ kind: "set_memory", memoryId: stored.id, state: "rejected", expectedRevision: stored.revision }, "member");
+    expect(memberReject.kind).toBe("denied");
+    expect(memberReject.message).toContain("manager");
+
+    const managerReject = await command({ kind: "set_memory", memoryId: stored.id, state: "rejected", expectedRevision: stored.revision }, "manager");
+    expect(managerReject.kind).toBe("accepted");
+    expect((await store.view(scope.id, "member")).memories.find(item => item.id === stored.id)?.state).toBe("rejected");
   });
 });

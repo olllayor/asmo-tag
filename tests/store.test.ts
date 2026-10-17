@@ -897,7 +897,7 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     await store.finishModel(consumed, turn(`Summary included ${oldFact}`));
     expect((await store.task(otherScope.id, "other", receipt.taskId)).task.result?.text).toContain(oldFact);
     const update: Command = change === "correct" ? { kind: "correct_memory", memoryId: memory.id, expectedRevision: memory.revision, content: "CURRENT corrected shared fact" } : { kind: "set_memory", memoryId: memory.id, state: change === "reject" ? "rejected" : "invalidated", expectedRevision: memory.revision };
-    expect((await command(update)).kind).toBe("accepted");
+    expect((await command(update, "manager")).kind).toBe("accepted");
     expect((await store.task(otherScope.id, "other", receipt.taskId)).task.result).toBeNull();
     await store.command({ scopeId: otherScope.id, userId: "other", key: randomUUID(), command: { kind: "steer", taskId: receipt.taskId, text: "Continue using only current facts" } });
     const next = await store.claim("memory-regression-worker", "model");

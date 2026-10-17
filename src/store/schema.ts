@@ -115,5 +115,5 @@ export const migrationSql = `${migrationStatements.map(statement => `${statement
 // database created by an older version replays only the entries newer than its own version,
 // in order. Fresh databases run migrationStatements, which already contains every entry.
 export const schemaUpgrades = [
-  { version: 2, statements: [messagesTaskIndex] },
+  { version: 2, statements: ["CREATE INDEX IF NOT EXISTS messages_task ON messages(workspace_id,scope_id,task_id);"] },
 ];

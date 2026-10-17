@@ -87,4 +87,21 @@ describe("TelegramAuthority caching", () => {
     expect(authority.recent({ ...scope, kind: "dm", ownerId: "101" }, "101")).toBe(true);
     expect(authority.recent({ ...scope, kind: "dm", ownerId: "102" }, "101")).toBe(false);
   });
+
+  it("does not restore a demoted user if an observation arrives while refresh is in flight", async () => {
+    let resolveApi: (value: unknown) => void = () => {};
+    const delayedMember = vi.fn(async () => new Promise(res => { resolveApi = res; }));
+    const authority = authorityWith(delayedMember, vi.fn(async () => botAdmin));
+    const refreshPromise = authority.refresh(scope, "101");
+    authority.observe(scope.id, "101", null);
+    resolveApi({ status: "administrator" });
+    await expect(refreshPromise).rejects.toThrow("Access denied.");
+    expect(store.membership).toHaveBeenLastCalledWith("scope-1", "101", null);
+  });
+
+  it("does not report freshly observed null role as recent authorization", () => {
+    const authority = authorityWith(vi.fn(async () => ({ status: "member" })), vi.fn(async () => botAdmin));
+    authority.observe(scope.id, "101", null);
+    expect(authority.recent(scope, "101")).toBe(false);
+  });
 });

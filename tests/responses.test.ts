@@ -193,14 +193,19 @@ describe("Responses provider boundary", () => {
     let capturedBody: Record<string, unknown> = {};
     const provider = model(async (_url, request) => { capturedBody = JSON.parse(String(request?.body)); return response(); });
     const instruction = "欧".repeat(16_000);
+    const toolPairs: Transcript[] = Array.from({ length: 50 }, (_, i) => ([
+      { role: "assistant" as const, content: [{ type: "tool_use" as const, id: `call-${i}`, name: "github_read_issues" as const, input: { repository: "acme/checkout" } }] },
+      { role: "user" as const, content: [{ type: "tool_result" as const, tool_use_id: `call-${i}`, content: "x".repeat(1200), is_error: false }] },
+    ])).flat();
     const history: Transcript[] = [
-      { role: "user", content: [{ type: "text", text: instruction }] },
-      ...Array.from({ length: 8 }, (_, i) => ({ role: "user" as const, content: [{ type: "text" as const, text: `Steer ${i}: ` + "欧".repeat(4_000) }] })),
+      ...toolPairs,
+      ...Array.from({ length: 4 }, (_, i) => ({ role: "user" as const, content: [{ type: "text" as const, text: `Steer ${i}: ` + "欧".repeat(4_000) }] })),
     ];
     const turn = await provider.turn({ ...input(history), task: { ...input().task, instruction } }, signal());
     expect(turn.outcome).toBe("complete");
     expect(Buffer.byteLength(JSON.stringify(capturedBody))).toBeLessThanOrEqual(100_000);
-    expect(turn.limitations.some(line => line.includes("truncated"))).toBe(true);
+    expect(turn.limitations.some(line => line.includes("task instruction"))).toBe(true);
+    expect(String(capturedBody.instructions)).toContain("[Task instruction truncated to fit context budget]");
   });
 
   it("drops the oldest message text when accumulated steers alone exceed the request limit", async () => {
@@ -211,6 +216,9 @@ describe("Responses provider boundary", () => {
     expect(turn.outcome).toBe("complete");
     expect(Buffer.byteLength(JSON.stringify(capturedBody))).toBeLessThanOrEqual(100_000);
     expect(turn.limitations.some(line => line.includes("truncated"))).toBe(true);
+    const serializedInput = JSON.stringify(capturedBody.input);
+    expect(serializedInput).not.toContain("Steer 0:");
+    expect(serializedInput).toContain("Steer 149:");
   });
 
   it("trims history text that carries stored provider state without a state mismatch", async () => {

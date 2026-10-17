@@ -13,7 +13,7 @@ import {
 import type {
   Approval, AuditEvent, Command, CommandInput, ConnectorReceipt, Delivery, Effect, Grant,
   Job, Memory, ModelInput, NormalizedUpdate, Receipt, Routine, Scope, Seed, Source, Store,
-  StoreOptions, Task, TaskView, ToolCall, ToolName, Transcript, Turn,
+  StoreOptions, Task, TaskView, ToolCall, ToolName, Transcript, Turn, WorkspaceView,
 } from "../core.js";
 
 
@@ -286,7 +286,7 @@ class SQLiteStore implements Store {
   redactedEffect(effect: Effect): Effect {
     return { ...effect, call: effect.call.name === "github_create_issue" ? { ...effect.call, input: { repository: effect.call.input.repository, title: "[Content removed]", body: "[Content removed]", labels: [] } } : effect.call.name === "notion_search" ? { ...effect.call, input: { query: "[Content removed]" } } : effect.call, result: effect.result === null ? null : "[Effect content removed following source invalidation]" };
   }
-  async view(scopeId: string, userId: string) {
+  async view(scopeId: string, userId: string, targetTaskId?: string): Promise<WorkspaceView> {
     return this.scopeTransaction(scopeId, async (db, scope) => {
       const role = await this.authorize(db, scope, userId);
       // One response carries at most viewTaskLimit records. The Mini App polls this endpoint,
@@ -294,8 +294,13 @@ class SQLiteStore implements Store {
       // disclosed through the view's limited field.
       const tasks = await records(db, "tasks", taskSchema, "scope_id=$1 ORDER BY data->>'createdAt' DESC LIMIT $2", [scopeId, viewTaskLimit + 1]);
       const usage = first(await rows(db, "SELECT held,spent FROM scopes WHERE workspace_id=$workspace AND id=$1", [scopeId], totalsSchema));
+      const selectedTasks = tasks.slice(0, viewTaskLimit);
+      if (targetTaskId && !selectedTasks.some(task => task.id === targetTaskId)) {
+        const target = (await records(db, "tasks", taskSchema, "scope_id=$1 AND id=$2", [scopeId, targetTaskId]))[0];
+        if (target) selectedTasks.push(target);
+      }
       const taskViews: TaskView[] = [];
-      for (const task of tasks.slice(0, viewTaskLimit)) taskViews.push(await this.taskView(db, scope, task));
+      for (const task of selectedTasks) taskViews.push(await this.taskView(db, scope, task));
       return workspaceViewSchema.parse({ scope, role, tasks: taskViews, memories: await records(db, "memories", memorySchema, "scope_id=$1", [scopeId]), routines: await records(db, "routines", routineSchema, "scope_id=$1", [scopeId]), grants: await records(db, "grants", grantSchema, "scope_id=$1", [scopeId]), usage: { heldMicros: usage.held, spentMicros: usage.spent, simulated: this.options.simulated }, limited: tasks.length > viewTaskLimit });
     });
   }
@@ -531,6 +536,7 @@ class SQLiteStore implements Store {
     const activating = memory.state !== "active" && targetState === "active";
     const staysPending = activating && !authoritative && command.kind === "correct_memory";
     if (activating && !authoritative && command.kind === "set_memory") return denied("Only a manager can activate a note.");
+    if (targetState === "rejected" && !authoritative && command.kind === "set_memory") return denied("Only a manager can reject a note.");
     if (activating && !staysPending) {
       const activeCount = first(await rows(db, "SELECT count(*) AS count FROM memories WHERE workspace_id=$workspace AND scope_id=$1 AND data->>'state'='active'", [scope.id], z.object({ count: z.coerce.number().int() }))).count;
       if (activeCount >= activeMemoryLimitPerScope) return denied(`Scope active memory limit reached (${activeMemoryLimitPerScope}).`);

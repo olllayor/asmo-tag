@@ -34,8 +34,8 @@ describe("Conversation controls", () => {
   });
 });
 
-describe("Secret comparison timing", () => {
-  it("compares digests so a different length is not an early exit", () => {
+describe("Secret comparison result coverage", () => {
+  it("returns correct equality results across matching, mismatching, and different-length inputs", () => {
     expect(equalSecret("synthetic-secret", "synthetic-secret")).toBe(true);
     expect(equalSecret("synthetic-secret", "synthetic-other")).toBe(false);
     expect(equalSecret("synthetic-secret", "shorter")).toBe(false);

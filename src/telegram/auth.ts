@@ -1,8 +1,9 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 
-// Hash both sides to fixed 32 byte digests before timingSafeEqual so the cost never
-// depends on where the inputs first differ or on their lengths being equal.
+// Hash both sides to fixed 32 byte digests before timingSafeEqual so only the final digest
+// comparison is fixed-size and equal-length, avoiding early exit on length differences.
+// Note that hashing itself still costs work proportional to each input's length.
 export function equalSecret(left: string, right: string): boolean {
   return timingSafeEqual(createHash("sha256").update(left).digest(), createHash("sha256").update(right).digest());
 }

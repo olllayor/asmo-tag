@@ -182,4 +182,20 @@ describe("view payload limits and per-task sources", () => {
     expect(view.tasks[0]?.task.instruction).toBe("Batch task 204");
     expect(view.tasks.some(item => item.task.instruction === "Batch task 4")).toBe(false);
   });
+
+  it("includes an older deep-linked task in the capped view response", async () => {
+    const oldestTaskId = await startCommand("Oldest deep linked task");
+    await drainJobs();
+    for (let index = 0; index < 205; index += 1) {
+      now += 1000;
+      await startCommand(`Subsequent task ${index}`);
+      await drainJobs();
+    }
+    const cappedView = await store.view(scope.id, "member");
+    expect(cappedView.tasks.some(t => t.task.id === oldestTaskId)).toBe(false);
+
+    const deepLinkedView = await store.view(scope.id, "member", oldestTaskId);
+    expect(deepLinkedView.tasks.some(t => t.task.id === oldestTaskId)).toBe(true);
+    expect(deepLinkedView.tasks.find(t => t.task.id === oldestTaskId)?.task.instruction).toBe("Oldest deep linked task");
+  });
 });

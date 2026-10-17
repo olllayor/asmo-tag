@@ -370,7 +370,7 @@ export interface Store {
   seed(input: Seed): Promise<void>;
   ingest(update: NormalizedUpdate): Promise<Receipt>;
   command(input: CommandInput): Promise<Receipt>;
-  view(scopeId: string, userId: string): Promise<WorkspaceView>;
+  view(scopeId: string, userId: string, targetTaskId?: string): Promise<WorkspaceView>;
   task(scopeId: string, userId: string, taskId: string): Promise<TaskView>;
   scopes(userId: string): Promise<Scope[]>;
   resolveChat(botId: string, chatId: string): Promise<Scope | null>;
