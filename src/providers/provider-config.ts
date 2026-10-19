@@ -8,12 +8,14 @@ export const providerProfiles = {
     provider: "openai", status: "supported", baseURL: "https://api.openai.com/v1",
     endpoint: "https://api.openai.com/v1/responses", apiKeyEnvironment: "OPENAI_API_KEY",
     strictTools: true, encryptedReasoning: true, storeParameter: true, serialToolParameter: true,
+    promptCacheKey: true,
     documentation: "https://developers.openai.com/api/docs/guides/function-calling",
   },
   deepseek: {
     provider: "deepseek", status: "supported", baseURL: "https://api.deepseek.com",
     endpoint: "https://api.deepseek.com/responses", apiKeyEnvironment: "DEEPSEEK_API_KEY",
     strictTools: false, encryptedReasoning: false, storeParameter: false, serialToolParameter: false,
+    promptCacheKey: false,
     documentation: "https://api-docs.deepseek.com/guides/responses_api/",
   },
   glm: {

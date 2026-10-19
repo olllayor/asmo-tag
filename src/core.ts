@@ -123,6 +123,7 @@ export type Transcript = z.infer<typeof transcriptSchema>;
 export const usageSchema = z.object({
   inputTokens: z.number().int().nonnegative(),
   cachedInputTokens: z.number().int().nonnegative().optional(),
+  cachedInputReported: z.boolean().optional(),
   reasoningOutputTokens: z.number().int().nonnegative().optional(),
   outputTokens: z.number().int().nonnegative(),
   costMicros: micros,

@@ -5,6 +5,7 @@ import { connectD1Database, inD1Transaction, isD1Database } from "./d1.js";
 import type { D1Connection, D1Database } from "./d1.js";
 import { z } from "zod";
 import { boundedCaptureLimitation, conversationAnswer, greetingReply } from "../conversation.js";
+import { bound, maxToolResultBytes, toolResultMarker } from "../limits.js";
 import {
   approvalSchema, commandSchema, effectSchema, eventSchema, grantSchema, memorySchema,
   nextWallClockInstant, routineSchema, scopeSchema, sourceSchema, taskSchema, taskViewSchema, transcriptSchema,
@@ -81,7 +82,6 @@ const heldReleaseBackoffMs = [1_000, 5_000, 30_000, 120_000];
 const scopeSourceWindowLimit = 300;
 const activeMemoryLimitPerScope = 20;
 const candidateMemoryLimitPerScope = 20;
-const maxToolResultBytes = 30_000;
 // Passive capture bounds. Sources over the retention cap are pruned oldest-first, and pure
 // passive messages stop being captured once a scope has captured this many in the window.
 // Both are overridable per store through StoreOptions.
@@ -398,10 +398,7 @@ class SQLiteStore implements Store {
     const pending = uses.filter(use => !results.has(use.id)).map(use => ({ use, effect: effects.find(effect => effect.call.id === use.id) }));
     if (pending.some(({ effect }) => !effect || !["succeeded", "denied"].includes(effect.state))) return false;
     await append(db, task, { role: "user", content: pending.map(({ use, effect }) => {
-      let result = effect?.result ?? "Tool denied.";
-      if (Buffer.byteLength(result) > maxToolResultBytes) {
-        result = `${Buffer.from(result, "utf8").subarray(0, maxToolResultBytes).toString("utf8")}\n[Tool result truncated to fit context budget]`;
-      }
+      const result = bound(effect?.result ?? "Tool denied.", maxToolResultBytes, toolResultMarker);
       return { type: "tool_result", tool_use_id: use.id, content: result, is_error: effect?.state !== "succeeded" };
     }) });
     await this.flushNotes(db, task);
@@ -1075,7 +1072,14 @@ class SQLiteStore implements Store {
       const task = await taskRecord(db, scope.id, job.input.task.id);
       const reservation = await this.settleReservation(db, scope, task, job.lease.token, result.usage.costMicros);
       if (!reservation) return;
+      // A zero on the first repeatable turn is expected: the shared prefix is still tiny. Only a
+      // drop from a previously cached turn says the prefix was actually broken. Read the prior
+      // turn before recording this one, or the lookup finds this turn and always sees zero.
+      const previousUsage = (await rows(db, "SELECT data FROM events WHERE workspace_id=$workspace AND task_id=$1 AND data->>'kind'='usage_reconciled' ORDER BY rowid DESC LIMIT 1", [task.id], z.object({ data: z.object({ detail: z.object({ cachedInputTokens: z.number().optional() }).passthrough() }).passthrough() })))[0];
       await event(db, scope, task.id, null, "usage_reconciled", { ...result.usage, requestId: digest(result.requestId) }, this.now());
+      if (result.usage.cachedInputReported && result.usage.cachedInputTokens === 0 && (previousUsage?.data.detail.cachedInputTokens ?? 0) > 0) {
+        await event(db, scope, task.id, null, "cache_break", { inputTokens: result.usage.inputTokens, requestId: digest(result.requestId) }, this.now());
+      }
       const row = (await rows(db, "SELECT * FROM jobs WHERE workspace_id=$workspace AND id=$1", [job.lease.id], jobRowSchema))[0];
       const workspace = first(await rows(db, "SELECT budget,held,spent,authority_revision FROM workspaces WHERE id=$workspace AND id=$1", [scope.workspaceId], workspaceRowSchema));
       const authorized = scope.active && await this.requesterAllowed(db, scope, task);
@@ -1176,10 +1180,7 @@ class SQLiteStore implements Store {
       const deniedRead = effect.call.name !== "github_create_issue" && (!scope.active || scope.policyRevision !== effect.policyRevision || !await this.requesterAllowed(db, scope, task) || !await this.effectResourceAllowed(db, scope, effect));
       const redacted = deniedRead || first(await rows(db, "SELECT redacted FROM effects WHERE workspace_id=$workspace AND id=$1", [effect.id], z.object({ redacted: z.boolean() }))).redacted;
       if (redacted) await db.query("UPDATE effects SET redacted=true WHERE workspace_id=$workspace AND id=$1", [effect.id]);
-      let content = redacted ? "Effect receipt excluded after evidence or authorization changed." : receipt.content;
-      if (Buffer.byteLength(content) > maxToolResultBytes) {
-        content = `${Buffer.from(content, "utf8").subarray(0, maxToolResultBytes).toString("utf8")}\n[Tool result truncated to fit context budget]`;
-      }
+      const content = redacted ? "Effect receipt excluded after evidence or authorization changed." : bound(receipt.content, maxToolResultBytes, toolResultMarker);
       const succeeded: Effect = { ...effect, state: "succeeded", providerId: deniedRead ? null : receipt.providerId, url: deniedRead ? null : receipt.url, result: content, reason: null };
       await save(db, "effects", succeeded);
       const source: Source = { id: uuid(), scopeId: scope.id, text: content, revision: 1, capturedAt: this.now(), messageId: null, kind: "tool" };

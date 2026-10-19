@@ -235,6 +235,27 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     expect((await claimModel()).input.history.flatMap(item => item.content).some(block => block.type === "text" && block.text.includes("Make it shorter"))).toBe(true);
   });
 
+  it("records a cache break only when a previously cached turn drops to zero", async () => {
+    const taskId = await start();
+    const usage = (cached: number) => ({ inputTokens: 100, outputTokens: 10, cachedInputTokens: cached, cachedInputReported: true, costMicros: 100, simulated: false, pricingRevision: "synthetic" });
+    const breaks = async () => ((await store.view(scope.id, "member", taskId)).tasks.find(view => view.task.id === taskId)?.events ?? []).filter(event => event.kind === "cache_break").length;
+
+    await store.finishModel(await claimModel(), turn("Needs input: which repository?", { outcome: "needs_input", usage: usage(0) }));
+    expect(await breaks()).toBe(0);
+
+    await command({ kind: "steer", taskId, text: "fixture/engineering" });
+    await store.finishModel(await claimModel(), turn("Needs input: which milestone?", { outcome: "needs_input", usage: usage(0) }));
+    expect(await breaks()).toBe(0);
+
+    await command({ kind: "steer", taskId, text: "the current one" });
+    await store.finishModel(await claimModel(), turn("Needs input: any label?", { outcome: "needs_input", usage: usage(40) }));
+    expect(await breaks()).toBe(0);
+
+    await command({ kind: "steer", taskId, text: "none" });
+    await store.finishModel(await claimModel(), turn("Needs input: confirm?", { outcome: "needs_input", usage: usage(0) }));
+    expect(await breaks()).toBe(1);
+  });
+
   it("edits long-work progress to remove Stop and sends a separate final answer", async () => {
     await store.ingest(message("Investigate the supplied reports", 100, { mentioned: true }));
     const model = await claimModel();
