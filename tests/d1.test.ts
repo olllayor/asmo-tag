@@ -138,22 +138,25 @@ describe("Cloudflare D1 migration", () => {
     rawDb.close();
   });
 
-  it("upgrades a v1 schema to v2 by creating messages_task index and updating meta version", async () => {
+  it("upgrades a v1 schema to the current version by creating the task indexes and updating meta", async () => {
     const rawDb = new DatabaseSync(":memory:");
     await migrateDatabase(createMockD1(rawDb));
     rawDb.exec("DROP INDEX IF EXISTS messages_task");
+    rawDb.exec("DROP INDEX IF EXISTS events_task");
     rawDb.exec("UPDATE asmo_schema_meta SET version=1 WHERE name='schema'");
 
     const beforeVersion = rawDb.prepare("SELECT version FROM asmo_schema_meta WHERE name='schema'").get() as { version: number };
     expect(beforeVersion.version).toBe(1);
     expect(rawDb.prepare("SELECT count(*) AS n FROM sqlite_master WHERE type='index' AND name='messages_task'").get()).toEqual({ n: 0 });
+    expect(rawDb.prepare("SELECT count(*) AS n FROM sqlite_master WHERE type='index' AND name='events_task'").get()).toEqual({ n: 0 });
 
     const conn = connectD1Database(createMockD1(rawDb));
     await conn.migrate();
 
     const afterVersion = rawDb.prepare("SELECT version FROM asmo_schema_meta WHERE name='schema'").get() as { version: number };
-    expect(afterVersion.version).toBe(2);
+    expect(afterVersion.version).toBe(schemaVersion);
     expect(rawDb.prepare("SELECT count(*) AS n FROM sqlite_master WHERE type='index' AND name='messages_task'").get()).toEqual({ n: 1 });
+    expect(rawDb.prepare("SELECT count(*) AS n FROM sqlite_master WHERE type='index' AND name='events_task'").get()).toEqual({ n: 1 });
     rawDb.close();
   });
 });

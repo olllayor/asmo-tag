@@ -1,6 +1,7 @@
-export const schemaVersion = 2;
+export const schemaVersion = 3;
 
 const messagesTaskIndex = "CREATE INDEX messages_task ON messages(workspace_id,scope_id,task_id);";
+const eventsTaskIndex = "CREATE INDEX events_task ON events(workspace_id,task_id);";
 
 // One entry per schema statement, in creation order. The Node backend execs the joined text
 // inside a single BEGIN IMMEDIATE; the D1 backend sends the same list as one batch, which D1
@@ -67,6 +68,9 @@ export const migrationStatements = [
  workspace_id TEXT NOT NULL, scope_id TEXT NOT NULL, task_id TEXT, id TEXT NOT NULL, data TEXT NOT NULL CHECK(json_valid(data)),
  PRIMARY KEY(workspace_id,id), FOREIGN KEY(workspace_id,scope_id) REFERENCES scopes(workspace_id,id), FOREIGN KEY(workspace_id,scope_id,task_id) REFERENCES tasks(workspace_id,scope_id,id)
 );`,
+  // Events are never pruned, so a task lookup without this index scans and parses every event
+  // in the workspace. The task view and the cache-break check both filter by task.
+  eventsTaskIndex,
   `CREATE TABLE memories (
  workspace_id TEXT NOT NULL, scope_id TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL CHECK(json_valid(data)),
  PRIMARY KEY(workspace_id,id), FOREIGN KEY(workspace_id,scope_id) REFERENCES scopes(workspace_id,id)
@@ -116,4 +120,5 @@ export const migrationSql = `${migrationStatements.map(statement => `${statement
 // in order. Fresh databases run migrationStatements, which already contains every entry.
 export const schemaUpgrades = [
   { version: 2, statements: ["CREATE INDEX IF NOT EXISTS messages_task ON messages(workspace_id,scope_id,task_id);"] },
+  { version: 3, statements: ["CREATE INDEX IF NOT EXISTS events_task ON events(workspace_id,task_id);"] },
 ];
