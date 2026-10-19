@@ -376,10 +376,11 @@ describe("SQLite task lifecycle with simulated integrations", () => {
   });
 
   it("supplies citation references for active memory whose raw evidence is outside the recent window", async () => {
-    await store.ingest(message("OLDER RAW MEMORY EVIDENCE", 15_000));
-    const initialTask = await start();
+    const captured = await store.ingest(message("OLDER RAW MEMORY EVIDENCE", 15_000, { mentioned: true }));
+    const initialTask = captured.taskId;
+    if (!initialTask) throw new Error("Initial task missing");
     const initialView = await store.task(scope.id, "member", initialTask);
-    const evidence = initialView.sources.find(source => source.text === "OLDER RAW MEMORY EVIDENCE");
+    const evidence = initialView.sources.find(source => source.kind === "message");
     if (!evidence) throw new Error("Memory evidence missing");
     await command({ kind: "remember", content: "A saved older fact remains useful", evidenceIds: [evidence.id], candidate: false });
     await command({ kind: "cancel", taskId: initialTask });
@@ -849,18 +850,24 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     const invalidated = await store.task(otherScope.id, "other", taskReceipt.taskId);
     expect(invalidated.task.result).toBeNull();
     expect(invalidated.events.some(event => event.kind === "dependent_context_invalidated")).toBe(true);
-    const draft = await draftWrite();
-    await command({ kind: "decide", approvalId: draft.approval.id, decision: "approve" }, "manager");
+    const draftStarted = await store.ingest(message("Draft an exact GitHub issue", 420, { mentioned: true }));
+    const draftTaskId = draftStarted.taskId;
+    if (!draftTaskId) throw new Error("Draft task missing");
+    const draftJob = await claimModel();
+    await store.finishModel(draftJob, turn("", { outcome: "tools", message: { role: "assistant", content: [{ type: "text", text: "Here is the exact issue." }, { type: "tool_use", id: randomUUID(), name: "github_create_issue", input: { repository: "fixture/engineering", title: "Fixture defect", body: "Exact simulated issue body", labels: ["bug"] } }] } }));
+    const approval = (await store.task(scope.id, "member", draftTaskId)).approvals[0];
+    if (!approval) throw new Error("Approval missing");
+    await command({ kind: "decide", approvalId: approval.id, decision: "approve" }, "manager");
     const dispatch = await claimEffect();
-    await store.ingest(message("Evidence supporting the pending effect", 422));
-    const source = (await store.task(scope.id, "member", draft.taskId)).sources.find(source => source.messageId === 422);
+    const source = (await store.task(scope.id, "member", draftTaskId)).sources.find(entry => entry.kind === "message");
     if (!source) throw new Error("Pending source missing");
+    const removedText = source.text;
     await command({ kind: "forget_sources", sourceIds: [source.id] }, "manager");
-    await store.finishEffect(dispatch, { providerId: "late-after-removal", url: null, content: "Evidence supporting the pending effect" });
-    const view = await store.task(scope.id, "member", draft.taskId);
+    await store.finishEffect(dispatch, { providerId: "late-after-removal", url: null, content: removedText });
+    const view = await store.task(scope.id, "member", draftTaskId);
     expect(view.effects[0]?.state).toBe("succeeded");
     expect(view.effects[0]?.providerId).toBe("late-after-removal");
-    expect(JSON.stringify(view)).not.toContain("Evidence supporting the pending effect");
+    expect(JSON.stringify(view)).not.toContain(removedText);
     expect(view.effects[0]?.call.name === "github_create_issue" && view.effects[0].call.input.body).toBe("[Content removed]");
   });
 
@@ -880,7 +887,7 @@ describe("SQLite task lifecycle with simulated integrations", () => {
   it.each(["correct", "reject", "invalidate"] as const)("removes a consumed shared fact from completed consumer history after memory %s", async change => {
     await command({ kind: "set_scope", workspacePublic: true }, "owner");
     const oldFact = `OLD PRIVATE CURATED FACT ${randomUUID()}`;
-    await command({ kind: "remember", content: oldFact, evidenceIds: [], candidate: false });
+    await command({ kind: "remember", content: oldFact, evidenceIds: [], candidate: false }, "manager");
     const memory = (await store.view(scope.id, "member")).memories[0];
     if (!memory) throw new Error("Shared memory missing");
     const receipt = await store.command({ scopeId: otherScope.id, userId: "other", key: randomUUID(), command: { kind: "start", instruction: "Summarize shared facts", topicId: null } });
@@ -889,8 +896,8 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     expect(consumed.input.memories.some(item => item.id === memory.id && item.content === oldFact)).toBe(true);
     await store.finishModel(consumed, turn(`Summary included ${oldFact}`));
     expect((await store.task(otherScope.id, "other", receipt.taskId)).task.result?.text).toContain(oldFact);
-    const update: Command = change === "correct" ? { kind: "correct_memory", memoryId: memory.id, expectedRevision: memory.revision, content: "CURRENT corrected shared fact" } : { kind: "set_memory", memoryId: memory.id, state: change === "reject" ? "rejected" : "invalidated" };
-    expect((await command(update)).kind).toBe("accepted");
+    const update: Command = change === "correct" ? { kind: "correct_memory", memoryId: memory.id, expectedRevision: memory.revision, content: "CURRENT corrected shared fact" } : { kind: "set_memory", memoryId: memory.id, state: change === "reject" ? "rejected" : "invalidated", expectedRevision: memory.revision };
+    expect((await command(update, "manager")).kind).toBe("accepted");
     expect((await store.task(otherScope.id, "other", receipt.taskId)).task.result).toBeNull();
     await store.command({ scopeId: otherScope.id, userId: "other", key: randomUUID(), command: { kind: "steer", taskId: receipt.taskId, text: "Continue using only current facts" } });
     const next = await store.claim("memory-regression-worker", "model");
@@ -912,7 +919,7 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     if (!memory) throw new Error("Retained memory missing");
     await command({ kind: "set_scope", active: false }, "manager");
     expect((await command({ kind: "correct_memory", memoryId: memory.id, expectedRevision: 1, content: "Corrected inactive-scope memory" })).kind).toBe("accepted");
-    expect((await command({ kind: "set_memory", memoryId: memory.id, state: "invalidated" })).kind).toBe("accepted");
+    expect((await command({ kind: "set_memory", memoryId: memory.id, state: "invalidated", expectedRevision: 2 })).kind).toBe("accepted");
     expect((await command({ kind: "forget_sources", sourceIds: [source.id] }, "member")).kind).toBe("denied");
     expect((await command({ kind: "forget_sources", sourceIds: [source.id] }, "manager")).kind).toBe("accepted");
     const view = await store.task(scope.id, "member", taskId);
@@ -924,7 +931,7 @@ describe("SQLite task lifecycle with simulated integrations", () => {
   it("redacts memory-derived effects while keeping exact in-flight recovery payloads", async () => {
     await command({ kind: "set_scope", workspacePublic: true }, "owner");
     const oldFact = `Sensitive shared fact ${randomUUID()}`;
-    await command({ kind: "remember", content: oldFact, evidenceIds: [], candidate: false });
+    await command({ kind: "remember", content: oldFact, evidenceIds: [], candidate: false }, "manager");
     const memory = (await store.view(scope.id, "member")).memories[0];
     if (!memory) throw new Error("Shared memory missing");
     await store.seed({ ...seed, scopes: [], memberships: [{ scopeId: otherScope.id, userId: "other_manager", role: "manager" }], grants: [{ ...seed.grants[0] as Exclude<typeof seed.grants[number], { kind: "notion_scope" }>, id: randomUUID(), scopeId: otherScope.id, repository: "fixture/engineering", read: true, write: true, active: true, revision: 1 }] });
@@ -936,7 +943,7 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     if (!approval) throw new Error("Consumer approval missing");
     await store.command({ scopeId: otherScope.id, userId: "other_manager", key: randomUUID(), command: { kind: "decide", approvalId: approval.id, decision: "approve" } });
     const dispatched = await claimEffect();
-    await command({ kind: "set_memory", memoryId: memory.id, state: "invalidated" });
+    await command({ kind: "set_memory", memoryId: memory.id, state: "invalidated", expectedRevision: memory.revision });
     const redacted = await store.task(otherScope.id, "other", receipt.taskId);
     expect(JSON.stringify(redacted)).not.toContain(oldFact);
     expect(redacted.effects[0]?.hash).toBe(dispatched.effect.hash);
@@ -1123,21 +1130,26 @@ describe("SQLite task lifecycle with simulated integrations", () => {
 
   it("caps active memories per scope and prevents memory explosion", async () => {
     for (let i = 0; i < 20; i++) {
-      const receipt = await command({ kind: "remember", content: `Memory ${i}`, evidenceIds: [], candidate: false });
+      const receipt = await command({ kind: "remember", content: `Candidate ${i}`, evidenceIds: [], candidate: false });
       expect(receipt.kind).toBe("accepted");
     }
-    const denied = await command({ kind: "remember", content: "Memory 20", evidenceIds: [], candidate: false });
-    expect(denied.kind).toBe("denied");
-    expect(denied.message).toContain("active memory limit");
+    const candidateFull = await command({ kind: "remember", content: "Candidate 20", evidenceIds: [], candidate: false });
+    expect(candidateFull.kind).toBe("denied");
+    expect(candidateFull.message).toContain("candidate memory limit");
 
-    const candidateReceipt = await command({ kind: "remember", content: "Candidate memory", evidenceIds: [], candidate: true });
-    expect(candidateReceipt.kind).toBe("accepted");
-    const candidateMem = (await store.view(scope.id, "member")).memories.find(m => m.state === "candidate");
-    if (!candidateMem) throw new Error("Candidate memory missing");
-
-    const activationDenied = await command({ kind: "set_memory", memoryId: candidateMem.id, state: "active" });
+    const firstCandidate = (await store.view(scope.id, "member")).memories.find(memory => memory.state === "candidate");
+    if (!firstCandidate) throw new Error("Candidate memory missing");
+    const activationDenied = await command({ kind: "set_memory", memoryId: firstCandidate.id, state: "active", expectedRevision: firstCandidate.revision });
     expect(activationDenied.kind).toBe("denied");
-    expect(activationDenied.message).toContain("active memory limit");
+    expect(activationDenied.message).toContain("manager");
+
+    for (let i = 0; i < 20; i++) {
+      const receipt = await command({ kind: "remember", content: `Manager active fact ${i}`, evidenceIds: [], candidate: false }, "manager");
+      expect(receipt.kind).toBe("accepted");
+    }
+    const activeFull = await command({ kind: "remember", content: "Manager active fact 20", evidenceIds: [], candidate: false }, "manager");
+    expect(activeFull.kind).toBe("denied");
+    expect(activeFull.message).toContain("active memory limit");
   });
 
   it("caps tool result size below request cap and truncates with visible limitation", async () => {

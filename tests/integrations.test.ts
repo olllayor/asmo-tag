@@ -288,4 +288,59 @@ describe('connector account linking and credential isolation', () => {
     await expect(connector.invoke(effect, new AbortController().signal)).rejects.toThrow('access denied');
     expect(fetcher).toHaveBeenCalledTimes(count);
   });
+  it("strips oversized issue payloads before trimming and handles unbounded titles within budget", async () => {
+    const linked = await github();
+    const effect: Effect = { id: "effect", workspaceId: scope.workspaceId, scopeId: scope.scopeId, taskId: "task", call: { id: "call", name: "github_read_issues", input: { repository: "team/project" } }, state: "dispatching", taskRevision: 1, policyRevision: 1, grantRevision: 1, hash: "hash", result: null, providerId: null, url: null, reason: null, connectionId: linked.id, connectionVersion: linked.credentialVersion };
+    const connector = createIntegrationToolConnector(service, { fetch: fetcher });
+
+    // Test 1: Oversized issue at index 0 (with long labels > 25KB) does not evict index 1
+    const oversizedLabels = Array.from({ length: 600 }, (_, i) => "label-" + i + "-" + "x".repeat(40));
+    fetcher.mockImplementation(async (input) => {
+      if (String(input).includes("/issues")) {
+        return response([
+          { id: 101, number: 1, html_url: "https://github.com/team/project/issues/1", title: "Issue 1", body: "Body 1", labels: oversizedLabels },
+          { id: 102, number: 2, html_url: "https://github.com/team/project/issues/2", title: "Issue 2", body: "Body 2", labels: ["bug"] },
+        ]);
+      }
+      return response([]);
+    });
+    const res1 = await connector.invoke(effect, new AbortController().signal);
+    const parsed1 = JSON.parse(res1.content);
+    expect(parsed1.issues.length).toBe(2);
+    expect(parsed1.issues[0].number).toBe(1);
+    expect(parsed1.issues[0].body).toBeNull();
+    expect(parsed1.issues[0].labels).toEqual([]);
+    expect(parsed1.issues[1].number).toBe(2);
+    expect(Buffer.byteLength(res1.content)).toBeLessThanOrEqual(25_000);
+
+    // Test 2: Oversized issue at index 1 is not dropped entirely
+    fetcher.mockImplementation(async (input) => {
+      if (String(input).includes("/issues")) {
+        return response([
+          { id: 101, number: 1, html_url: "https://github.com/team/project/issues/1", title: "Issue 1", body: "Body 1", labels: ["bug"] },
+          { id: 102, number: 2, html_url: "https://github.com/team/project/issues/2", title: "Issue 2", body: "Body 2", labels: oversizedLabels },
+        ]);
+      }
+      return response([]);
+    });
+    const res2 = await connector.invoke(effect, new AbortController().signal);
+    const parsed2 = JSON.parse(res2.content);
+    expect(parsed2.issues.length).toBe(2);
+    expect(parsed2.issues[1].number).toBe(2);
+    expect(parsed2.issues[1].body).toBeNull();
+
+    // Test 3: Single issue with huge title (> 25KB) has title truncated/cleared and fits in budget
+    fetcher.mockImplementation(async (input) => {
+      if (String(input).includes("/issues")) {
+        return response([
+          { id: 101, number: 1, html_url: "https://github.com/team/project/issues/1", title: "T".repeat(30_000), body: "Body 1", labels: [] },
+        ]);
+      }
+      return response([]);
+    });
+    const res3 = await connector.invoke(effect, new AbortController().signal);
+    const parsed3 = JSON.parse(res3.content);
+    expect(parsed3.issues.length).toBe(1);
+    expect(Buffer.byteLength(res3.content)).toBeLessThanOrEqual(25_000);
+  });
 });

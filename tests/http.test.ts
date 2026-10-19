@@ -1,5 +1,6 @@
 import { createHmac, randomBytes, randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { request as httpRequest } from "node:http";
@@ -26,9 +27,15 @@ describe("HTTP auth and scoped command boundary against SQLite", () => {
   let scope: Scope;
   let privateScope: Scope;
   let taskId: string;
+  let createdMiniAppFixture = false;
   const auth = { Authorization: "Fixture 101" };
   const headers = { ...auth, "Content-Type": "application/json" };
   beforeAll(async () => {
+    if (!existsSync("web/dist/index.html")) {
+      createdMiniAppFixture = true;
+      await mkdir("web/dist", { recursive: true });
+      await writeFile("web/dist/index.html", "<!doctype html><html lang=\"en\"><head><title>Asmo</title></head><body>Mini App</body></html>");
+    }
     const workspaceId = randomUUID();
     directory = await mkdtemp(join(tmpdir(), "asmo-http-"));
     store = await openStore({ databasePath: join(directory, "http.sqlite"), modelReserveMicros: 1000, maxOutputTokens: 1024, maxTurns: 4, taskBudgetMicros: 100000, leaseMs: 10000, simulated: true, workspaceIds: [workspaceId] });
@@ -46,6 +53,11 @@ describe("HTTP auth and scoped command boundary against SQLite", () => {
     if (taskId) await store.command({ scopeId: scope.id, userId: "101", key: randomUUID(), command: { kind: "cancel", taskId } });
     await new Promise<void>((accept, reject) => server.close(error => error ? reject(error) : accept()));
     await store.close();
+    if (createdMiniAppFixture) {
+      // The placeholder must not outlive the suite and later masquerade as the built Mini App.
+      await rm("web/dist/index.html", { force: true });
+      await rm("web/dist", { force: true }).catch(() => {});
+    }
     await rm(directory, { recursive: true, force: true });
   });
   it("rejects missing identity, unknown fixture actors and hidden scopes", async () => {
@@ -86,6 +98,16 @@ describe("HTTP auth and scoped command boundary against SQLite", () => {
     expect((await fetch(`${url}/api/session`, { headers: { ...auth, Origin: url } })).status).toBe(200);
     expect((await fetch(`${url}/telegram/webhook`, { method: "POST", body: "{}" })).status).toBe(401);
   });
+  it("serves the Mini App with a restrictive content security policy", async () => {
+    const page = await fetch(`${url}/`);
+    expect(page.status).toBe(200);
+    expect(page.headers.get("content-type")).toBe("text/html; charset=utf-8");
+    // Exact directive values, so an added permissive source cannot pass as a substring.
+    const directives = Object.fromEntries((page.headers.get("content-security-policy") ?? "").split(";").map(part => { const [name, ...values] = part.trim().split(/\s+/); return [name, values.join(" ")]; }));
+    expect(directives["default-src"]).toBe("'none'");
+    expect(directives["script-src"]).toBe("'self' https://telegram.org");
+    expect(directives["frame-ancestors"]).toBe("'self' https://web.telegram.org https://*.telegram.org");
+  });
   it("links Notion through authenticated HTTP and creates only the verified scope grant", async () => {
     const token = "123456:synthetic";
     const config = readConfig({ ASMO_MODE: "live", ASMO_DATABASE_PATH: join(directory, "http.sqlite"), TELEGRAM_BOT_TOKEN: token, TELEGRAM_WEBHOOK_SECRET: "synthetic-webhook-secret", OPENAI_API_KEY: "synthetic", ASMO_MODEL: "synthetic", ASMO_CACHED_INPUT_USD_PER_MILLION: "0.1", ASMO_INPUT_USD_PER_MILLION: "1", ASMO_OUTPUT_USD_PER_MILLION: "1", ASMO_MODEL_RESERVE_MICROS: "200000" });
@@ -112,7 +134,10 @@ describe("HTTP auth and scoped command boundary against SQLite", () => {
       const link = await started.json() as { authorizationUrl: string };
       const state = new URL(link.authorizationUrl).searchParams.get("state")!;
       const callback = `${base}/connectors/notion/callback?state=${encodeURIComponent(state)}&code=mock-code`;
-      expect((await fetch(callback)).status).toBe(200);
+      const page = await fetch(callback);
+      expect(page.status).toBe(200);
+      expect(page.headers.get("content-security-policy")).toContain("default-src 'none'");
+      expect(page.headers.get("referrer-policy")).toBe("no-referrer");
       expect((await fetch(callback)).status).toBe(403);
       expect(calls).toBe(1);
       const listing = await fetch(`${base}/api/integrations?scope=${scope.id}`, { headers: signed(101) });
@@ -165,6 +190,36 @@ describe("HTTP auth and scoped command boundary against SQLite", () => {
       await new Promise<void>((accept, reject) => transport.close(error => error ? reject(error) : accept()));
     }
   }, 10000);
+
+  it("serves a deep-linked task through /api/view that the task cap omits", async () => {
+    const drain = async () => {
+      let viewDrainMessageId = 900_000;
+      for (let attempt = 0; attempt < 1000; attempt += 1) {
+        const job = await store.claim("http-view-drain");
+        if (!job) return;
+        if (job.kind === "model") {
+          await store.finishModel(job, { message: { role: "assistant", content: [{ type: "text", text: "Batch answer recorded." }] }, usage: { inputTokens: 30, outputTokens: 20, costMicros: 0, simulated: true, pricingRevision: "fixture-v1" }, requestId: randomUUID(), outcome: "complete", sourceIds: [], limitations: [] });
+        } else if (job.kind === "delivery") {
+          await store.finishDelivery(job, ++viewDrainMessageId);
+        } else throw new Error("Unexpected effect job in the deep-link drain");
+      }
+      throw new Error("Deep-link job queue did not settle");
+    };
+    const oldest = await store.command({ scopeId: scope.id, userId: "101", key: randomUUID(), command: { kind: "start", instruction: "Oldest deep linked task", topicId: null } });
+    if (oldest.kind !== "accepted" || !oldest.taskId) throw new Error("Deep link task missing");
+    await drain();
+    for (let index = 0; index < 205; index += 1) {
+      await store.command({ scopeId: scope.id, userId: "101", key: randomUUID(), command: { kind: "start", instruction: `Batch task ${index}`, topicId: null } });
+      await drain();
+    }
+    const capped = await (await fetch(`${url}/api/view?scope=${scope.id}`, { headers: auth })).json() as { limited: boolean; tasks: { task: { id: string } }[] };
+    expect(capped.limited).toBe(true);
+    expect(capped.tasks.some(item => item.task.id === oldest.taskId)).toBe(false);
+    // The server passes the `task` launch parameter into the store view, so a task older
+    // than the newest 200 still reaches its deep link owner.
+    const linked = await (await fetch(`${url}/api/view?scope=${scope.id}&task=${encodeURIComponent(oldest.taskId)}`, { headers: auth })).json() as { limited: boolean; tasks: { task: { id: string } }[] };
+    expect(linked.tasks.some(item => item.task.id === oldest.taskId)).toBe(true);
+  });
 });
 
 describe("Telegram launch parameters carry navigation only", () => {

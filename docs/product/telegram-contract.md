@@ -97,7 +97,7 @@ Review mode sends the proposed group output privately to the connector owner, wi
 
 ## Memory behavior
 
-Match Tag with automatic curated notes and explicit save/correct/forget requests. Eligible group members can inspect and correct group memory. Explicitly product-public groups may save workspace notes. Product-private groups can read approved workspace notes but save only group notes. Individual DMs and small private-group scopes remain separate. L/P automatic notes remain reviewable candidates until the memory evaluation gate passes.
+Match Tag with automatic curated notes and explicit save/correct/forget requests. Eligible group members can inspect and correct group memory. A member note without usable source evidence stays a candidate until a manager accepts it, only a manager or group/workspace owner activates or restores notes, and forgetting a note is terminal for members; in a DM its owner holds that authority. Explicitly product-public groups may save workspace notes. Product-private groups can read approved workspace notes but save only group notes. Individual DMs and small private-group scopes remain separate. L/P automatic notes remain reviewable candidates until the memory evaluation gate passes.
 
 ## Exact action review
 

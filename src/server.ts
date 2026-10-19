@@ -68,13 +68,23 @@ export function createHttpServer(app: HttpApplication) {
         const raw = await body(req);
         let update = normalizeUpdate(raw, app.bot);
         if (!update) { json(res, 200, { kind: "ignored" }); return; }
+        if (update.kind === "membership") {
+          const scope = await app.store.resolveChat(app.bot.id, update.chatId);
+          if (scope) app.authority?.observe(scope.id, update.userId, update.role === "owner" ? "manager" : update.role);
+          if (update.botRemoved) app.authority?.invalidateBot(update.chatId);
+        }
         if ("userId" in update && update.userId && update.kind !== "membership") {
           const scope = await app.store.resolveChat(app.bot.id, update.chatId);
           // Ingest rechecks the stored membership, so a failed refresh must not fail the
           // webhook: a non-2xx response makes Telegram redeliver the update and deepen the load.
           if (scope) {
             try { await app.authority?.refresh(scope, update.userId); }
-            catch { console.error("Membership refresh failed before intake. Ingest continues with the last-known membership."); }
+            catch {
+              // Drop the update when nobody confirmed this user recently, so the stale window
+              // stays bounded instead of growing with the outage.
+              if (app.authority && !app.authority.recent(scope, update.userId)) { json(res, 200, { kind: "ignored" }); return; }
+              console.error("Membership refresh failed before intake. Ingest continues with the last-known membership.");
+            }
           }
         }
         if (app.files && update.kind === "message") {
@@ -133,10 +143,11 @@ export function createHttpServer(app: HttpApplication) {
         }
         if (url.pathname === "/api/view" && req.method === "GET") {
           const scopeId = z.string().min(1).max(128).parse(url.searchParams.get("scope"));
+          const taskId = z.string().min(1).max(128).nullish().parse(url.searchParams.get("task"));
           const existing = (await app.store.scopes(userId)).find(scope => scope.id === scopeId);
           if (!existing) throw new Error("Access denied.");
           await app.authority?.refresh(existing, userId);
-          json(res, 200, await app.store.view(scopeId, userId)); return;
+          json(res, 200, await app.store.view(scopeId, userId, taskId ?? undefined)); return;
         }
         if (url.pathname === "/api/command" && req.method === "POST") {
           const input = z.object({ scopeId: z.string().min(1).max(128), key: z.string().min(1).max(128), command: commandSchema }).strict().parse(await body(req));
@@ -154,7 +165,13 @@ export function createHttpServer(app: HttpApplication) {
       if (requested !== staticRoot && !requested.startsWith(`${staticRoot}${sep}`)) { json(res, 404, { error: "Not found." }); return; }
       const path = url.pathname === "/" ? resolve(staticRoot, "index.html") : requested;
       const bytes = await readFile(path);
-      res.writeHead(200, { "Content-Type": ({ ".html": "text/html; charset=utf-8", ".js": "text/javascript", ".css": "text/css" } as Record<string, string>)[extname(path)] ?? "application/octet-stream", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer" });
+      // The CSP is the defense in depth for the initData bearer the Mini App renders with.
+      // Scripts stay limited to the app bundle and the official telegram.org bridge, and
+      // only Telegram clients may frame the page. No SRI on that bridge script, Telegram
+      // updates it server side and a hash would break every build. Residual risk: script
+      // content from telegram.org stays trusted and initData remains replayable until
+      // validation rejects its age in auth.ts, so the CSP only narrows any XSS blast radius.
+      res.writeHead(200, { "Content-Type": ({ ".html": "text/html; charset=utf-8", ".js": "text/javascript", ".css": "text/css" } as Record<string, string>)[extname(path)] ?? "application/octet-stream", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "Content-Security-Policy": "default-src 'none'; script-src 'self' https://telegram.org; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'self' https://web.telegram.org https://*.telegram.org; base-uri 'none'; form-action 'none'" });
       res.end(bytes);
     } catch (error) {
       json(res, error instanceof z.ZodError || error instanceof SyntaxError ? 400 : 403, { error: "Request rejected. Check authentication, scope, configuration, and input." });

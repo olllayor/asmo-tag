@@ -129,21 +129,58 @@ export function createGitHubConnector(options: Options): IssueConnector {
         const filtered = issues.filter((issue) => issue.pull_request === undefined);
         let mapped = filtered.map((issue) => JSON.parse(receipt(issue, repository).content));
         let truncated = false;
+        mapped = mapped.map((item) => {
+          if (Buffer.byteLength(JSON.stringify(item)) > 25_000) {
+            truncated = true;
+            const stripped = { ...item, body: null, labels: [] };
+            if (Buffer.byteLength(JSON.stringify(stripped)) > 25_000) {
+              return { ...stripped, title: typeof stripped.title === 'string' ? stripped.title.slice(0, 100) : '' };
+            }
+            return stripped;
+          }
+          return item;
+        });
         while (Buffer.byteLength(JSON.stringify(mapped)) > 25_000 && mapped.length > 1) {
           mapped = mapped.slice(0, -1);
           truncated = true;
         }
-        return receiptSchema.parse({
-          providerId: `github-read:${repository}`,
-          url: null,
-          content: JSON.stringify({
+        if (Buffer.byteLength(JSON.stringify(mapped)) > 25_000 && mapped.length === 1) {
+          // One issue can exceed the budget on its own (long labels or body). Keep its
+          // identity so the model can still act on it, and drop the payload fields.
+          const [single] = mapped;
+          let fallback = { ...single, body: null, labels: [] };
+          if (Buffer.byteLength(JSON.stringify([fallback])) > 25_000) {
+            fallback = { ...fallback, title: typeof fallback.title === 'string' ? fallback.title.slice(0, 100) : '' };
+            if (Buffer.byteLength(JSON.stringify([fallback])) > 25_000) {
+              fallback = { ...fallback, title: '' };
+            }
+          }
+          mapped = [fallback];
+          truncated = true;
+        }
+        let content = JSON.stringify({
+          simulated: false,
+          repository,
+          issues: mapped,
+          coverage: truncated
+            ? 'First page of issues and pull requests (truncated to fit tool result budget). Earlier pages were not retrieved.'
+            : 'First page of at most 100 issues and pull requests. Earlier pages were not retrieved.',
+        });
+        if (Buffer.byteLength(content) > 25_000 && mapped.length === 1) {
+          const [single] = mapped;
+          mapped = [{ ...single, body: null, labels: [], title: '' }];
+          truncated = true;
+          content = JSON.stringify({
             simulated: false,
             repository,
             issues: mapped,
-            coverage: truncated
-              ? 'First page of issues and pull requests (truncated to fit tool result budget). Earlier pages were not retrieved.'
-              : 'First page of at most 100 issues and pull requests. Earlier pages were not retrieved.',
-          }),
+            coverage: 'First page of issues and pull requests (truncated to fit tool result budget). Earlier pages were not retrieved.',
+          });
+        }
+        return receiptSchema.parse({
+          providerId: `github-read:${repository}`,
+          url: null,
+          content,
         });
       }
       const { title, body, labels } = effect.call.input;

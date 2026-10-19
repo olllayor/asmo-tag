@@ -149,6 +149,19 @@ export function createResponsesModel(rawOptions: ResponsesOptions): ModelProvide
       let effectiveHistory = input.history;
       let effectiveMemories = input.memories.filter(memory => memory.state === "active");
       let effectiveSources = input.sources;
+      // Byte-accurate cut: slices count UTF-16 units, so a character slice can overshoot a
+      // byte budget by up to 4x on multibyte text. Back up to the previous UTF-8 character boundary
+      // before decoding so we never emit replacement characters.
+      const cut = (value: string, bytes: number) => {
+        const buf = Buffer.from(value, "utf8");
+        if (buf.length <= bytes) return value;
+        let end = Math.max(0, bytes);
+        while (end > 0 && ((buf[end] ?? 0) & 0xC0) === 0x80) {
+          end--;
+        }
+        return buf.subarray(0, end).toString("utf8");
+      };
+      let taskInstruction = input.task.instruction;
 
       const buildBody = (hist: Transcript[], mems: typeof effectiveMemories, srcs: typeof effectiveSources): ResponseCreateParamsNonStreaming => {
         const evidence = JSON.stringify({
@@ -158,8 +171,8 @@ export function createResponsesModel(rawOptions: ResponsesOptions): ModelProvide
         });
         return {
           model: options.model, max_output_tokens: input.maxOutputTokens, stream: false,
-          instructions: `${instructions}\nCurrent task instruction:\n${input.task.instruction}\nUntrusted authorized evidence as JSON:\n${evidence}`,
-          input: hist.length ? historyItems(hist, identity) : [{ role: "user", content: input.task.instruction }],
+          instructions: `${instructions}\nCurrent task instruction:\n${taskInstruction}\nUntrusted authorized evidence as JSON:\n${evidence}`,
+          input: hist.length ? historyItems(hist, identity) : [{ role: "user", content: taskInstruction }],
           tools: functionTools(input.tools, profile), tool_choice: input.tools.length ? "auto" : "none",
           ...(profile.storeParameter ? { store: false } : {}),
           ...(profile.encryptedReasoning ? { include: ["reasoning.encrypted_content"] } : {}),
@@ -170,6 +183,8 @@ export function createResponsesModel(rawOptions: ResponsesOptions): ModelProvide
       let body = buildBody(effectiveHistory, effectiveMemories, effectiveSources);
       let bodyBytes = Buffer.byteLength(JSON.stringify(body));
 
+      let instructionTrimmed = false;
+
       if (bodyBytes > options.maxRequestBytes) {
         const maxToolBytes = 30_000;
         let historyTrimmed = false;
@@ -178,7 +193,7 @@ export function createResponsesModel(rawOptions: ResponsesOptions): ModelProvide
           content: entry.content.map(block => {
             if (block.type === "tool_result" && Buffer.byteLength(block.content) > maxToolBytes) {
               historyTrimmed = true;
-              return { ...block, content: `${block.content.slice(0, maxToolBytes)}\n[Tool result truncated to fit context budget]` };
+              return { ...block, content: `${cut(block.content, maxToolBytes)}\n[Tool result truncated to fit context budget]` };
             }
             return block;
           }),
@@ -204,16 +219,63 @@ export function createResponsesModel(rawOptions: ResponsesOptions): ModelProvide
         }
 
         if (bodyBytes > options.maxRequestBytes) {
-          effectiveHistory = effectiveHistory.map(entry => ({
-            ...entry,
-            content: entry.content.map(block => {
-              if (block.type === "tool_result" && block.content.length > 1000) {
-                truncatedContext = true;
-                return { ...block, content: `${block.content.slice(0, 1000)}\n[Tool result truncated to fit context budget]` };
+          effectiveHistory = effectiveHistory.map(entry => {
+            let trimmed = false;
+            const content = entry.content.map(block => {
+              if (block.type === "tool_result" && Buffer.byteLength(block.content) > 1000) {
+                trimmed = true;
+                return { ...block, content: `${cut(block.content, 1000)}\n[Tool result truncated to fit context budget]` };
+              }
+              if (block.type === "text" && Buffer.byteLength(block.text) > 1000) {
+                trimmed = true;
+                return { ...block, text: `${cut(block.text, 1000)}\n[History text truncated to fit context budget]` };
               }
               return block;
-            }),
-          }));
+            });
+            if (!trimmed) return entry;
+            truncatedContext = true;
+            // Trimmed content no longer matches the stored provider state, so replay it neutrally.
+            return { ...entry, content, providerState: undefined };
+          });
+          body = buildBody(effectiveHistory, effectiveMemories, effectiveSources);
+          bodyBytes = Buffer.byteLength(JSON.stringify(body));
+        }
+
+        // Message text carries member-written instructions and steers, so the entry count is not
+        // bounded by the turn limit. Each pass drops enough oldest text-only entries to cover
+        // the measured excess and then rebuilds the body once, so long histories never pay a
+        // full re-serialization per dropped entry.
+        if (bodyBytes > options.maxRequestBytes) {
+          const dropOldestTextEntries = (excess: number) => {
+            const toDrop = new Set<number>();
+            let freed = 0;
+            for (let i = 0; i < effectiveHistory.length; i++) {
+              const entry = effectiveHistory[i];
+              if (!entry || !entry.content.every(block => block.type === "text")) continue;
+              toDrop.add(i);
+              const items = historyItems([entry], identity);
+              freed += items.reduce((sum, it) => sum + Buffer.byteLength(JSON.stringify(it)) + 1, 0);
+              if (freed >= excess) break;
+            }
+            return toDrop;
+          };
+          while (bodyBytes > options.maxRequestBytes) {
+            const toDrop = dropOldestTextEntries(bodyBytes - options.maxRequestBytes);
+            if (toDrop.size === 0) break;
+            effectiveHistory = effectiveHistory.filter((_, idx) => !toDrop.has(idx));
+            truncatedContext = true;
+            body = buildBody(effectiveHistory, effectiveMemories, effectiveSources);
+            bodyBytes = Buffer.byteLength(JSON.stringify(body));
+          }
+        }
+
+        const instructionMarker = "\n[Task instruction truncated to fit context budget]";
+        let currentInstructionBytes = Buffer.byteLength(taskInstruction);
+        while (bodyBytes > options.maxRequestBytes && currentInstructionBytes > 200) {
+          instructionTrimmed = true;
+          currentInstructionBytes = Math.max(200, Math.floor(currentInstructionBytes / 2));
+          taskInstruction = `${cut(input.task.instruction, currentInstructionBytes)}${instructionMarker}`;
+          truncatedContext = true;
           body = buildBody(effectiveHistory, effectiveMemories, effectiveSources);
           bodyBytes = Buffer.byteLength(JSON.stringify(body));
         }
@@ -244,7 +306,13 @@ export function createResponsesModel(rawOptions: ResponsesOptions): ModelProvide
       if (calls.length && text.startsWith("Needs input:")) throw new Error("Provider requested a tool while asking for user input");
       let outcome: Turn["outcome"] = incomplete || refusal ? "incomplete" : calls.length ? "tools" : text.startsWith("Needs input:") ? "needs_input" : "complete";
       const limitations = [contextCoverageLimitation(input.collectedSince)];
-      if (truncatedContext) limitations.push("Context was truncated to fit the model request byte limit. Some older memories, sources, or tool outputs were shortened or omitted.");
+      if (truncatedContext) {
+        limitations.push(
+          instructionTrimmed
+            ? "Context was truncated to fit the model request byte limit. The current task instruction, older messages, memories, sources, or tool outputs were shortened or omitted."
+            : "Context was truncated to fit the model request byte limit. Some older messages, memories, sources, or tool outputs were shortened or omitted."
+        );
+      }
       if (incomplete || refusal) limitations.push(`Provider ${refusal ? "refused" : "did not complete"} the response; work is incomplete.`);
       if (!profile.serialToolParameter) limitations.push("Provider cannot disable parallel tool calls. The application rejects responses with more than one function call.");
       if (!content.length && outcome === "complete") { outcome = "incomplete"; limitations.push("Provider returned no answer or tool call."); }

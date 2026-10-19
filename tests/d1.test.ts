@@ -137,6 +137,25 @@ describe("Cloudflare D1 migration", () => {
     await expect(createMockD1(rawDb).exec("PRAGMA user_version")).rejects.toThrow("SQLITE_AUTH");
     rawDb.close();
   });
+
+  it("upgrades a v1 schema to v2 by creating messages_task index and updating meta version", async () => {
+    const rawDb = new DatabaseSync(":memory:");
+    await migrateDatabase(createMockD1(rawDb));
+    rawDb.exec("DROP INDEX IF EXISTS messages_task");
+    rawDb.exec("UPDATE asmo_schema_meta SET version=1 WHERE name='schema'");
+
+    const beforeVersion = rawDb.prepare("SELECT version FROM asmo_schema_meta WHERE name='schema'").get() as { version: number };
+    expect(beforeVersion.version).toBe(1);
+    expect(rawDb.prepare("SELECT count(*) AS n FROM sqlite_master WHERE type='index' AND name='messages_task'").get()).toEqual({ n: 0 });
+
+    const conn = connectD1Database(createMockD1(rawDb));
+    await conn.migrate();
+
+    const afterVersion = rawDb.prepare("SELECT version FROM asmo_schema_meta WHERE name='schema'").get() as { version: number };
+    expect(afterVersion.version).toBe(2);
+    expect(rawDb.prepare("SELECT count(*) AS n FROM sqlite_master WHERE type='index' AND name='messages_task'").get()).toEqual({ n: 1 });
+    rawDb.close();
+  });
 });
 
 describe("D1Connection execution", () => {
@@ -302,7 +321,7 @@ describe("Cloudflare D1 store lifecycle", () => {
     await expect(openStore(storeOptions(d1, () => Date.now()))).rejects.toThrow("newer than this application");
 
     // Once the cause is gone the same binding must start again instead of replaying the error.
-    rawDb.exec("UPDATE asmo_schema_meta SET version=1 WHERE name='schema'");
+    rawDb.exec(`UPDATE asmo_schema_meta SET version=${schemaVersion} WHERE name='schema'`);
     const store = await openStore(storeOptions(d1, () => Date.now()));
     await store.close();
     rawDb.close();

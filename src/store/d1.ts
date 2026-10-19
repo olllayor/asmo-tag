@@ -2,7 +2,7 @@
 // docs/engineering/edge-experimental.md before changing this file.
 import type { Db, Row } from "./sql.js";
 import { binding, decode, prepareSql } from "./sql.js";
-import { migrationStatements, schemaVersion } from "./schema.js";
+import { migrationStatements, schemaUpgrades, schemaVersion } from "./schema.js";
 import type { z } from "zod";
 
 export interface D1PreparedStatement {
@@ -67,7 +67,7 @@ export class D1Connection {
     if (currentVersion < schemaVersion) {
       const statements = [
         `CREATE TABLE IF NOT EXISTS ${schemaMetaTable}(name TEXT PRIMARY KEY NOT NULL, version INTEGER NOT NULL)`,
-        ...migrationStatements,
+        ...(currentVersion === 0 ? migrationStatements : schemaUpgrades.filter(upgrade => upgrade.version > currentVersion).flatMap(upgrade => upgrade.statements)),
         `INSERT INTO ${schemaMetaTable}(name,version) VALUES('schema',${schemaVersion}) ON CONFLICT(name) DO UPDATE SET version=${schemaVersion}`,
       ];
       await this.database.batch(statements.map(sql => this.database.prepare(sql)));

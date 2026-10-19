@@ -82,6 +82,10 @@ Live setup is an operator path, not a deployment performed by this build. Set `A
 
 Run one active application/connector worker process. Rotating OAuth-token refresh is not coordinated across multiple app processes. Expose the application behind an HTTPS reverse proxy only after its connected acceptance checks pass. Configure the bot's Mini App direct link, client URL, and authenticated webhook. Request the member and bot-membership updates needed for current policy. The bot needs administrator membership for reliable group-member checks; delete and ban capabilities are not required by the product.
 
+Security requirements for reverse proxies and access logs:
+- **Header scrubbing**: Proxies and access logs on the application path must not capture or retain the `Authorization` header (it carries `tma` `initData`) or the `x-telegram-bot-api-secret-token` webhook header; scrub them wherever the deployment records request headers.
+- **initData credential protection**: The `initData` bearer is replayable for up to one hour inside its signed age window, so log or cache exposure of that header is equivalent to handing over the session; rotate the bot token to invalidate outstanding `initData`.
+
 Set `ASMO_DATABASE_PATH` to the separate pilot file. SQLite schema initialization runs when the store opens; `db:migrate` also provides an explicit initialization step. Bootstrap takes a reviewed seed JSON containing bot/workspace identities, scope IDs, memberships, empty connector grants, and budgets. It verifies bot and owner membership and posts a collection notice before saving active bindings. OAuth callbacks create connection-bound resource grants after authorization.
 
 ```sh

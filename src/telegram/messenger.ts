@@ -123,7 +123,7 @@ const botTtlMs = 60_000;
 const maxMemberEntries = 5_000;
 const maxConcurrentChecks = 4;
 
-type MemberEntry = { role?: "manager" | "member" | null; at: number; promise?: Promise<"manager" | "member" | null> };
+type MemberEntry = { role?: "manager" | "member" | null; at: number; generation: number; promise?: Promise<"manager" | "member" | null> };
 
 export class TelegramAuthority {
   private readonly api: Api;
@@ -131,8 +131,49 @@ export class TelegramAuthority {
   private readonly bots = new Map<string, { at: number; promise: Promise<void> }>();
   private active = 0;
   private readonly queued: (() => void)[] = [];
+  private generation = 0;
 
   constructor(token: string, private readonly botId: string, private readonly store: Store, api: Api = new Api(token, { timeoutSeconds: 20 })) { this.api = api; }
+
+  // A pushed membership update is itself a fresh observation. Without this the cached role
+  // survives a demotion and refresh writes it back over the row the update just cleared.
+  observe(scopeId: string, userId: string, role: "manager" | "member" | null): void {
+    const key = `${scopeId}:${userId}`;
+    const generation = ++this.generation;
+    const existing = this.members.get(key);
+    if (existing) {
+      existing.role = role;
+      existing.at = Date.now();
+      existing.generation = generation;
+      return;
+    }
+    if (this.members.size >= maxMemberEntries) {
+      for (const [k, candidate] of this.members) {
+        if (candidate.promise === undefined) {
+          this.members.delete(k);
+          break;
+        }
+      }
+    }
+    if (this.members.size >= maxMemberEntries) {
+      for (const [k] of this.members) {
+        this.members.delete(k);
+        break;
+      }
+    }
+    this.members.set(key, { role, at: Date.now(), generation });
+  }
+
+  invalidateBot(chatId: string): void { this.bots.delete(chatId); }
+
+  // True when the last successful observation can still authorize intake. The webhook checks
+  // this so a swallowed refresh failure cannot extend the stale window with the outage.
+  recent(scope: Scope, userId: string): boolean {
+    if (scope.kind === "dm") return scope.ownerId === userId;
+    if (scope.kind !== "group") return false;
+    const last = this.members.get(`${scope.id}:${userId}`);
+    return last?.role != null && Date.now() - last.at <= memberStaleLimitMs;
+  }
 
   async refresh(scope: Scope, userId: string): Promise<void> {
     if (scope.kind === "dm") {
@@ -141,20 +182,31 @@ export class TelegramAuthority {
     }
     if (scope.kind !== "group") throw new Error("Access denied.");
     await this.botAdmin(scope.chatId);
+    const key = `${scope.id}:${userId}`;
+    const initialEntry = this.members.get(key);
+    const initialGen = initialEntry?.generation ?? 0;
     let role: "manager" | "member" | null;
     try {
       role = await this.memberRole(scope, userId);
     } catch (error) {
-      const last = this.members.get(`${scope.id}:${userId}`);
-      if (last?.role === undefined || Date.now() - last.at > memberStaleLimitMs) throw error;
+      const last = this.members.get(key);
+      if (last?.role == null || Date.now() - last.at > memberStaleLimitMs) throw error;
       console.error("Membership refresh failed. Continuing with the last-known role.");
       role = last.role;
+    }
+    const currentEntry = this.members.get(key);
+    // A generation bump means a newer observation landed while this check ran. Its role,
+    // including an explicit null demotion, replaces the in-flight result; an undefined role
+    // belongs to a reset check whose outcome was never observed, so keep the fresh result.
+    if (currentEntry && currentEntry.generation !== initialGen && currentEntry.role !== undefined) {
+      role = currentEntry.role;
     }
     await this.store.membership(scope.id, userId, role);
     if (role === null) throw new Error("Access denied.");
   }
 
   private async limited<T>(work: () => Promise<T>): Promise<T> {
+    if (this.queued.length >= maxMemberEntries) throw new Error("Membership check capacity reached.");
     while (this.active >= maxConcurrentChecks) await new Promise<void>(resolve => this.queued.push(resolve));
     this.active++;
     try { return await work(); } finally { this.active--; this.queued.shift()?.(); }
@@ -163,6 +215,15 @@ export class TelegramAuthority {
   private botAdmin(chatId: string): Promise<void> {
     const cached = this.bots.get(chatId);
     if (cached && Date.now() - cached.at < botTtlMs) return cached.promise;
+    if (!cached && this.bots.size >= maxMemberEntries) {
+      for (const [k] of this.bots) {
+        this.bots.delete(k);
+        break;
+      }
+    }
+    if (!cached && this.bots.size >= maxMemberEntries) {
+      throw new Error("Bot check capacity reached.");
+    }
     const entry = { at: Date.now(), promise: this.limited(async () => {
       const bot = await this.api.getChatMember(chatId, Number(this.botId));
       if (bot.status !== "administrator" && bot.status !== "creator") throw new Error("Asmo needs administrator membership for reliable member checks.");
@@ -178,17 +239,32 @@ export class TelegramAuthority {
     const cached = this.members.get(key);
     if (cached?.promise) return cached.promise;
     if (cached?.role !== undefined && Date.now() - cached.at < memberTtlMs) return Promise.resolve(cached.role);
-    const entry: MemberEntry = cached ?? { at: 0 };
+    if (!cached) {
+      if (this.members.size >= maxMemberEntries) {
+        for (const [k, candidate] of this.members) {
+          if (candidate.promise === undefined) {
+            this.members.delete(k);
+            break;
+          }
+        }
+      }
+      if (this.members.size >= maxMemberEntries) {
+        throw new Error("Membership check capacity reached.");
+      }
+    }
+    const entry: MemberEntry = cached ?? { at: 0, generation: ++this.generation };
+    const checkGen = entry.generation;
     entry.promise = this.limited(async () => {
       const member = await this.api.getChatMember(scope.chatId, Number(userId));
       return ["creator", "administrator"].includes(member.status) ? "manager" : member.status === "member" || (member.status === "restricted" && member.is_member) ? "member" : null;
     });
     if (!cached) this.members.set(key, entry);
-    if (this.members.size > maxMemberEntries) {
-      const oldest = this.members.keys().next().value;
-      if (oldest !== undefined) this.members.delete(oldest);
-    }
-    entry.promise.then(role => { entry.role = role; entry.at = Date.now(); }).catch(() => { /* keep the last-known observation for the stale fallback */ }).finally(() => { delete entry.promise; });
+    entry.promise.then(role => {
+      if (entry.generation === checkGen) {
+        entry.role = role;
+        entry.at = Date.now();
+      }
+    }).catch(() => { /* keep the last-known observation for the stale fallback */ }).finally(() => { delete entry.promise; });
     return entry.promise;
   }
 }
