@@ -224,7 +224,7 @@ describe("Responses provider boundary", () => {
     expect(turn.limitations.some(line => line.includes("truncated"))).toBe(true);
   });
 
-  it("drops the oldest message text when accumulated steers alone exceed the request limit", async () => {
+  it("replaces the dropped oldest messages with one summary", async () => {
     let capturedBody: Record<string, unknown> = {};
     const provider = model(async (_url, request) => { capturedBody = JSON.parse(String(request?.body)); return response(); });
     const history: Transcript[] = Array.from({ length: 150 }, (_, i) => ({ role: "user" as const, content: [{ type: "text" as const, text: `Steer ${i}: ` + "欧".repeat(4_000) }] }));
@@ -233,8 +233,25 @@ describe("Responses provider boundary", () => {
     expect(Buffer.byteLength(JSON.stringify(capturedBody))).toBeLessThanOrEqual(100_000);
     expect(turn.limitations.some(line => line.includes("truncated"))).toBe(true);
     const serializedInput = JSON.stringify(capturedBody.input);
-    expect(serializedInput).not.toContain("Steer 0:");
-    expect(serializedInput).toContain("Steer 149:");
+    expect(serializedInput).not.toContain("Steer 0: " + "欧".repeat(4_000));
+    expect(serializedInput).toContain("Steer 149: ");
+    expect(serializedInput).toContain("<summary>");
+    expect(turn.compaction?.entries).toBeGreaterThan(0);
+    expect(turn.compaction?.summary).toContain("<summary>");
+  });
+
+  it("reuses a stored summary instead of re-dropping the same window", async () => {
+    let capturedBody: Record<string, unknown> = {};
+    const provider = model(async (_url, request) => { capturedBody = JSON.parse(String(request?.body)); return response(); });
+    const history: Transcript[] = Array.from({ length: 4 }, (_, i) => ({ role: "user" as const, content: [{ type: "text" as const, text: `Steer ${i}` }] }));
+    const summary = "<summary>\n<goal>\n- earlier work\n</goal>\n<decisions>\n- none\n</decisions>\n<state>\n- idle\n</state>\n</summary>";
+    const turn = await provider.turn({ ...input(history), task: { ...input().task, compaction: { entries: 2, summary } } }, signal());
+    expect(turn.outcome).toBe("complete");
+    const items = requestItems(capturedBody.input);
+    expect(items[0]).toMatchObject({ role: "user", content: expect.stringContaining("earlier work") });
+    expect(JSON.stringify(items)).toContain("Steer 2");
+    expect(JSON.stringify(items)).not.toContain("Steer 0");
+    expect(turn.compaction).toBeUndefined();
   });
 
   it("trims history text that carries stored provider state without a state mismatch", async () => {

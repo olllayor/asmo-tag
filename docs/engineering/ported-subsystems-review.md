@@ -1,19 +1,16 @@
 # Ported subsystems review
 
-Reviewed 2026-10-20 against `main` at `0e86f18`, with the prompt cache work from #10 on a separate branch. Three modules were built in parallel: a file memory engine, a compaction manager, and a tool search engine.
+Reviewed 2026-10-20 against the prompt cache work in #10. Three modules were built in parallel: a file memory engine, a compaction manager, and a tool search engine.
 
 ## Status
 
-None of the three is wired into the application. Every import of `src/memory`, `src/context`, and `src/tools` comes from that module's own test file:
+Compaction is wired into the request path. Memory and tool search are parked, and nothing imports them outside their own tests. The reasoning for each is below.
 
 ```
-$ grep -rln "memory/file-memory\|context/compaction\|tools/tool-search" src/ tests/
+$ grep -rln "memory/file-memory\|tools/tool-search" src/ tests/
 tests/memory/file-memory.test.ts
-tests/context/compaction.test.ts
 tests/tools/tool-search.test.ts
 ```
-
-The request path still builds tools from `src/providers/responses.ts` and `src/store/index.ts`. Their 102 tests pass, and they prove the modules in isolation, not the runtime.
 
 ## Fixed in this pass
 
@@ -28,7 +25,7 @@ The request path still builds tools from `src/providers/responses.ts` and `src/s
 | Module | Verdict | Reason |
 | --- | --- | --- |
 | File memory | Park | The sandbox is sound, but wiring it needs a new tool execution path and a filesystem dependency. |
-| Compaction | Park, fix first | The pairing bug is fixed, but a stateless compaction would change the prompt prefix every turn. |
+| Compaction | Wired | The boundary is persisted on the task, so the summary is sent once and reused instead of recomputed. |
 | Tool search | Do not wire | Changing the tool array mid-session invalidates the prompt prefix, which is the problem #10 exists to fix. |
 
 ### File memory
@@ -44,9 +41,11 @@ What blocks wiring:
 
 ### Compaction
 
-Usable as a library once the pairing bug is fixed. It cannot be dropped into the provider as it stands.
+Wired in `src/providers/responses.ts` and persisted by `finishModel`. When the history ladder drops entries, the provider summarizes the dropped span with `defaultStructuredSummarizer`, prepends the summary to the request, and returns it on the turn. The store writes it to `task.compaction` as `{ entries, summary }`. Later turns slice the transcript at `entries` and send the stored summary, so the prefix is stable instead of re-dropping a different window each turn.
 
-The provider is stateless per turn. It recomputes the window from the stored transcript. A summary derived from the dropped entries would therefore be recomputed on every turn, and it would appear on turns that drop and vanish on turns that do not. Either case changes the prefix and defeats the cache. Making compaction solid needs the boundary persisted, which means a task field or a summary transcript entry plus a transcript flag, and a decision about who pays for the summarizer call.
+The summary comes from the module's deterministic summarizer, so there is no extra model call and no change to the budget path. It is bounded to 4 KB.
+
+Measured with a probe over eight turns and 28 KB tool results, which is the case that used to reset the prefix on every turn: the prefix now resets only on the turns where a new compaction happens, and is reused in between. With 2 KB tool results nothing compacts and the prefix grows every turn as before.
 
 ### Tool search
 
@@ -54,17 +53,15 @@ This one conflicts with the work that just landed. The cache is a byte prefix ma
 
 Parking it is the honest call. If it is ever needed, the cache-safe shape is a fixed tool inventory plus a tool that answers discovery questions in its result, never a changing schema.
 
-## If this gets wired
+## Remaining
 
-In order of value to cost:
-
-1. Persist a compaction boundary on the task, then let the store run a summarizer call on the parent prefix and store the result as a transcript entry. That closes the long-task cache reset measured in #11 and gives the compaction module a real consumer.
-2. Give the memory engine a scope root and an internal tool path, behind a scope flag. It is a scratchpad, not the curated memory table.
-3. Leave tool search out unless the tool inventory grows past what fits in the prefix.
+1. Give the memory engine a scope root and an internal tool path, behind a scope flag. It is a scratchpad, not the curated memory table.
+2. Leave tool search out unless the tool inventory grows past what fits in the prefix.
+3. Raise the compaction threshold only if the measured reset rate matters. Two turns of 28 KB results fill 75 percent of the cap, so compaction can only happen that often.
 
 ## Verification
 
-- `npx vitest run tests/memory tests/context tests/tools`: 103 tests pass after the fixes.
+- `pnpm test`: 387 tests pass across 23 files.
 - `pnpm check` is clean.
 - The compaction test was checked against the defect it names: removing the tool-result guard makes it report `expected [ 'call-1' ] to deeply equal []`.
 - The sandbox probe is in the PR description, not the repo, because it plants symlinks outside the tree.

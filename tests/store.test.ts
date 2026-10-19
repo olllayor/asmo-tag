@@ -256,6 +256,13 @@ describe("SQLite task lifecycle with simulated integrations", () => {
     expect(await breaks()).toBe(1);
   });
 
+  it("persists the compaction a provider turn reports", async () => {
+    const taskId = await start();
+    await store.finishModel(await claimModel(), turn("Still working", { outcome: "needs_input", compaction: { entries: 3, summary: "<summary>\n<goal>\n- earlier work\n</goal>\n</summary>" } }));
+    const stored = await store.task(scope.id, "member", taskId);
+    expect(stored.task.compaction).toEqual({ entries: 3, summary: "<summary>\n<goal>\n- earlier work\n</goal>\n</summary>" });
+  });
+
   it("edits long-work progress to remove Stop and sends a separate final answer", async () => {
     await store.ingest(message("Investigate the supplied reports", 100, { mentioned: true }));
     const model = await claimModel();

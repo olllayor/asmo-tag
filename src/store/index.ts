@@ -1098,7 +1098,7 @@ class SQLiteStore implements Store {
       const toolIds = result.message.content.filter(block => block.type === "tool_use").map(block => block.id);
       if (result.message.role !== "assistant" || toolIds.length !== new Set(toolIds).size) { await this.blockModel(db, scope, task, "Provider returned an invalid assistant message or repeated tool identifier."); return; }
       const sequence = await append(db, task, result.message);
-      const progressed: Task = { ...task };
+      const progressed: Task = { ...task, ...(result.compaction ? { compaction: result.compaction } : {}) };
       await save(db, "tasks", progressed);
       if (result.outcome === "tools") {
         const uses = result.message.content.filter(block => block.type === "tool_use");
