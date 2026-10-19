@@ -89,14 +89,23 @@ describe("TelegramAuthority caching", () => {
   });
 
   it("does not restore a demoted user if an observation arrives while refresh is in flight", async () => {
-    let resolveApi: (value: unknown) => void = () => {};
-    const delayedMember = vi.fn(async () => new Promise(res => { resolveApi = res; }));
-    const authority = authorityWith(delayedMember, vi.fn(async () => botAdmin));
-    const refreshPromise = authority.refresh(scope, "101");
-    authority.observe(scope.id, "101", null);
-    resolveApi({ status: "administrator" });
-    await expect(refreshPromise).rejects.toThrow("Access denied.");
-    expect(store.membership).toHaveBeenLastCalledWith("scope-1", "101", null);
+    vi.useFakeTimers();
+    try {
+      let resolveApi: (value: unknown) => void = () => {};
+      const member = vi.fn(async (): Promise<unknown> => ({ status: "administrator" }));
+      const authority = authorityWith(member, vi.fn(async () => botAdmin));
+      await authority.refresh(scope, "101");
+      // Age the cached observation so the next refresh performs a real member check.
+      vi.advanceTimersByTime(6_000);
+      member.mockImplementationOnce(() => new Promise<unknown>(res => { resolveApi = res; }));
+      const refreshPromise = authority.refresh(scope, "101");
+      // The member check must actually be in flight before the observation lands.
+      await vi.waitFor(() => { expect(member).toHaveBeenCalledTimes(2); });
+      authority.observe(scope.id, "101", null);
+      resolveApi({ status: "administrator" });
+      await expect(refreshPromise).rejects.toThrow("Access denied.");
+      expect(store.membership).toHaveBeenLastCalledWith("scope-1", "101", null);
+    } finally { vi.useRealTimers(); }
   });
 
   it("does not report freshly observed null role as recent authorization", () => {

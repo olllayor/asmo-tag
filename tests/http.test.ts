@@ -27,10 +27,12 @@ describe("HTTP auth and scoped command boundary against SQLite", () => {
   let scope: Scope;
   let privateScope: Scope;
   let taskId: string;
+  let createdMiniAppFixture = false;
   const auth = { Authorization: "Fixture 101" };
   const headers = { ...auth, "Content-Type": "application/json" };
   beforeAll(async () => {
     if (!existsSync("web/dist/index.html")) {
+      createdMiniAppFixture = true;
       await mkdir("web/dist", { recursive: true });
       await writeFile("web/dist/index.html", "<!doctype html><html lang=\"en\"><head><title>Asmo</title></head><body>Mini App</body></html>");
     }
@@ -51,6 +53,11 @@ describe("HTTP auth and scoped command boundary against SQLite", () => {
     if (taskId) await store.command({ scopeId: scope.id, userId: "101", key: randomUUID(), command: { kind: "cancel", taskId } });
     await new Promise<void>((accept, reject) => server.close(error => error ? reject(error) : accept()));
     await store.close();
+    if (createdMiniAppFixture) {
+      // The placeholder must not outlive the suite and later masquerade as the built Mini App.
+      await rm("web/dist/index.html", { force: true });
+      await rm("web/dist", { force: true }).catch(() => {});
+    }
     await rm(directory, { recursive: true, force: true });
   });
   it("rejects missing identity, unknown fixture actors and hidden scopes", async () => {
@@ -183,6 +190,36 @@ describe("HTTP auth and scoped command boundary against SQLite", () => {
       await new Promise<void>((accept, reject) => transport.close(error => error ? reject(error) : accept()));
     }
   }, 10000);
+
+  it("serves a deep-linked task through /api/view that the task cap omits", async () => {
+    const drain = async () => {
+      let viewDrainMessageId = 900_000;
+      for (let attempt = 0; attempt < 1000; attempt += 1) {
+        const job = await store.claim("http-view-drain");
+        if (!job) return;
+        if (job.kind === "model") {
+          await store.finishModel(job, { message: { role: "assistant", content: [{ type: "text", text: "Batch answer recorded." }] }, usage: { inputTokens: 30, outputTokens: 20, costMicros: 0, simulated: true, pricingRevision: "fixture-v1" }, requestId: randomUUID(), outcome: "complete", sourceIds: [], limitations: [] });
+        } else if (job.kind === "delivery") {
+          await store.finishDelivery(job, ++viewDrainMessageId);
+        } else throw new Error("Unexpected effect job in the deep-link drain");
+      }
+      throw new Error("Deep-link job queue did not settle");
+    };
+    const oldest = await store.command({ scopeId: scope.id, userId: "101", key: randomUUID(), command: { kind: "start", instruction: "Oldest deep linked task", topicId: null } });
+    if (oldest.kind !== "accepted" || !oldest.taskId) throw new Error("Deep link task missing");
+    await drain();
+    for (let index = 0; index < 205; index += 1) {
+      await store.command({ scopeId: scope.id, userId: "101", key: randomUUID(), command: { kind: "start", instruction: `Batch task ${index}`, topicId: null } });
+      await drain();
+    }
+    const capped = await (await fetch(`${url}/api/view?scope=${scope.id}`, { headers: auth })).json() as { limited: boolean; tasks: { task: { id: string } }[] };
+    expect(capped.limited).toBe(true);
+    expect(capped.tasks.some(item => item.task.id === oldest.taskId)).toBe(false);
+    // The server passes the `task` launch parameter into the store view, so a task older
+    // than the newest 200 still reaches its deep link owner.
+    const linked = await (await fetch(`${url}/api/view?scope=${scope.id}&task=${encodeURIComponent(oldest.taskId)}`, { headers: auth })).json() as { limited: boolean; tasks: { task: { id: string } }[] };
+    expect(linked.tasks.some(item => item.task.id === oldest.taskId)).toBe(true);
+  });
 });
 
 describe("Telegram launch parameters carry navigation only", () => {

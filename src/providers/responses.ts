@@ -242,41 +242,30 @@ export function createResponsesModel(rawOptions: ResponsesOptions): ModelProvide
         }
 
         // Message text carries member-written instructions and steers, so the entry count is not
-        // bounded by the turn limit. Drop the oldest text-only entries in one pass,
-        // computing the cut point from the oldest text-only entries, then rebuild the body once.
+        // bounded by the turn limit. Each pass drops enough oldest text-only entries to cover
+        // the measured excess and then rebuilds the body once, so long histories never pay a
+        // full re-serialization per dropped entry.
         if (bodyBytes > options.maxRequestBytes) {
-          const excess = bodyBytes - options.maxRequestBytes;
-          const textOnlyIndices: number[] = [];
-          for (let i = 0; i < effectiveHistory.length; i++) {
-            const entry = effectiveHistory[i];
-            if (entry && entry.content.every(block => block.type === "text")) {
-              textOnlyIndices.push(i);
-            }
-          }
-          if (textOnlyIndices.length > 0) {
-            let freed = 0;
+          const dropOldestTextEntries = (excess: number) => {
             const toDrop = new Set<number>();
-            for (const idx of textOnlyIndices) {
-              const entry = effectiveHistory[idx];
-              if (!entry) continue;
-              toDrop.add(idx);
+            let freed = 0;
+            for (let i = 0; i < effectiveHistory.length; i++) {
+              const entry = effectiveHistory[i];
+              if (!entry || !entry.content.every(block => block.type === "text")) continue;
+              toDrop.add(i);
               const items = historyItems([entry], identity);
-              const entrySize = items.reduce((sum, it) => sum + Buffer.byteLength(JSON.stringify(it)) + 1, 0);
-              freed += entrySize;
+              freed += items.reduce((sum, it) => sum + Buffer.byteLength(JSON.stringify(it)) + 1, 0);
               if (freed >= excess) break;
             }
+            return toDrop;
+          };
+          while (bodyBytes > options.maxRequestBytes) {
+            const toDrop = dropOldestTextEntries(bodyBytes - options.maxRequestBytes);
+            if (toDrop.size === 0) break;
             effectiveHistory = effectiveHistory.filter((_, idx) => !toDrop.has(idx));
             truncatedContext = true;
             body = buildBody(effectiveHistory, effectiveMemories, effectiveSources);
             bodyBytes = Buffer.byteLength(JSON.stringify(body));
-
-            while (bodyBytes > options.maxRequestBytes) {
-              const index = effectiveHistory.findIndex(entry => entry.content.every(block => block.type === "text"));
-              if (index < 0) break;
-              effectiveHistory = effectiveHistory.filter((_, at) => at !== index);
-              body = buildBody(effectiveHistory, effectiveMemories, effectiveSources);
-              bodyBytes = Buffer.byteLength(JSON.stringify(body));
-            }
           }
         }
 

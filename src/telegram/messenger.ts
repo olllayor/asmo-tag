@@ -195,8 +195,11 @@ export class TelegramAuthority {
       role = last.role;
     }
     const currentEntry = this.members.get(key);
-    if (currentEntry && currentEntry.generation !== initialGen) {
-      role = currentEntry.role ?? role;
+    // A generation bump means a newer observation landed while this check ran. Its role,
+    // including an explicit null demotion, replaces the in-flight result; an undefined role
+    // belongs to a reset check whose outcome was never observed, so keep the fresh result.
+    if (currentEntry && currentEntry.generation !== initialGen && currentEntry.role !== undefined) {
+      role = currentEntry.role;
     }
     await this.store.membership(scope.id, userId, role);
     if (role === null) throw new Error("Access denied.");
