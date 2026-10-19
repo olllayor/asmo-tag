@@ -120,6 +120,15 @@
     Thariq Shihipar, Apr 30 2026. Read against <code>c2ca2dc</code>. This is analysis, not a change.
   </p>
 
+  <div class="callout">
+    <p>
+      Snapshot. This reads the repo at <code>c2ca2dc</code>, before the change.
+      <a href="https://github.com/olllayor/asmo-tag/pull/10">PR #10</a> implements steals 01, 02 and 03, plus the
+      <code>cache_break</code> half of 06. It defers 04 and rejects 05. The "Today" tab describes the code this review was
+      written against, not the current tree.
+    </p>
+  </div>
+
   <div class="tldr">
     <p>
       The article is one constraint wearing five lessons: the provider reuses a request only up to the first byte that changed,
@@ -245,7 +254,7 @@
       <tbody>
         <tr><td class="num">src/providers/responses.ts:47-58</td><td>Base system prompt. Static today, and it should stay that way.</td></tr>
         <tr><td class="num">src/providers/responses.ts:166-181</td><td>Request assembly. Evidence is concatenated into <code>instructions</code>.</td></tr>
-        <tr><td class="num">src/providers/responses.ts:188-283</td><td>Five pass truncation ladder. Edits bytes inside the prefix.</td></tr>
+        <tr><td class="num">src/providers/responses.ts:188-283</td><td>Six pass truncation ladder. Three passes rewrite bytes inside the prefix.</td></tr>
         <tr><td class="num">src/providers/responses.ts:295-326</td><td>Cached token accounting and per turn cost.</td></tr>
         <tr><td class="num">src/store/index.ts:926-956</td><td><code>modelContext</code>: source window, memories, live grant tools.</td></tr>
         <tr><td class="num">src/store/index.ts:1017-1039</td><td>Claim path. Notes flush, then the context snapshot is taken.</td></tr>
@@ -332,7 +341,8 @@ return { task, history: await history(db, task.id), sources,
     <h2>The truncation ladder edits the middle of the prefix</h2>
     <div class="split">
       <div>
-<pre><code>// src/providers/responses.ts:188
+<pre><code>// src/providers/responses.ts:188-283, paraphrased
+// Each pass in the real ladder rebuilds the body and recounts its bytes.
 if (bodyBytes &gt; options.maxRequestBytes) {
   // 1. rewrite oversized tool results in place
   // 2. drop oldest memories
@@ -373,8 +383,8 @@ if (bodyBytes &gt; options.maxRequestBytes) {
     <h2>What it costs today</h2>
     <p>
       The inputs default to a 6 turn task, a 4k token evidence block, and a 10x cached discount. Change them to your
-      configured prices and observed request sizes. The estimate counts only input tokens, and assumes the head would hit
-      after turn one.
+      configured prices and observed request sizes. The estimate counts only input tokens. The first turn pays full price
+      because there is no earlier request to reuse, and the head hits from turn two.
     </p>
 
     <div class="calc">
@@ -486,7 +496,7 @@ const input = [
       </summary>
       <div class="body">
         <p>
-          The truncation ladder has six passes and four of them rewrite content in the middle of the request. Replace them with
+          The truncation ladder has six passes. Three of them, passes 1, 4 and 6, rewrite content in the middle of the request. Replace them with
           a rule: only remove whole entries from the oldest end, and never touch a kept entry.
         </p>
         <ul>
@@ -770,7 +780,8 @@ const input = [
     for (let t = 0; t < turns; t++) {
       const h = hist + growth * t;
       current += (sys + ev + h) * pin / 1e6;
-      after += (sys + h) * pcache / 1e6 + ev * pin / 1e6;
+      // The first turn has no earlier request to reuse, so it pays full price on the head too.
+      after += t === 0 ? (sys + ev + h) * pin / 1e6 : (sys + h) * pcache / 1e6 + ev * pin / 1e6;
     }
 
     document.getElementById('cur').textContent = money(current);

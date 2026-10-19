@@ -216,7 +216,11 @@ export function createResponsesModel(rawOptions: ResponsesOptions): ModelProvide
           body = buildBody(effectiveHistory, effectiveMemories, effectiveSources);
           bodyBytes = Buffer.byteLength(JSON.stringify(body));
         }
+      }
 
+      // History is the most expensive context to lose, so drop it only when the request is still
+      // over the cap after the tail context is gone.
+      if (bodyBytes > options.maxRequestBytes) {
         // Drop whole units from the front. A unit is one entry, or a call entry plus every
         // following entry that carries its results, because the provider rejects a call whose
         // output is missing. Only a contiguous prefix is dropped, so a kept entry can never be
@@ -243,12 +247,21 @@ export function createResponsesModel(rawOptions: ResponsesOptions): ModelProvide
 
         // Drop to a low-water mark instead of to the cap. Dropping only the measured excess puts
         // the next turn back over the cap, so it drops again and the prefix resets every turn.
+        // Count the units to drop from byte estimates first, then rebuild once, because a rebuild
+        // per unit makes a long history quadratic.
         const target = Math.floor(options.maxRequestBytes * 0.75);
         while (bodyBytes > target) {
           const built = units();
           if (built.length <= 1) break;
-          const dropped = new Set(built[0]!);
-          effectiveHistory = effectiveHistory.filter((_, index) => !dropped.has(index));
+          const excess = bodyBytes - target;
+          let dropCount = 0;
+          let freed = 0;
+          while (dropCount < built.length - 1 && freed < excess) {
+            for (const index of built[dropCount]!) freed += Buffer.byteLength(JSON.stringify(effectiveHistory[index]!));
+            dropCount++;
+          }
+          if (dropCount === 0) break;
+          effectiveHistory = effectiveHistory.slice(built[dropCount - 1]!.at(-1)! + 1);
           truncatedContext = true;
           body = buildBody(effectiveHistory, effectiveMemories, effectiveSources);
           bodyBytes = Buffer.byteLength(JSON.stringify(body));

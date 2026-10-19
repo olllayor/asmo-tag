@@ -2,16 +2,16 @@
 // numbers: a value the store writes and the adapter then re-cuts is rewritten on every turn,
 // and every rewrite invalidates the cached prefix.
 
-// Schema caps instructions and steers at 16,000 characters, so four bytes per character is
-// the largest a valid one can be. A bound this high never fires for input the command layer
-// accepted, which keeps the prompt stable for real conversations.
+// Schema caps instructions and steers at 16,000 characters, which encodes to at most 48,000
+// bytes. The bound sits above that so it never fires for input the command layer accepted,
+// which keeps the prompt stable for real conversations.
 export const maxTextBytes = 64_000;
 export const maxToolResultBytes = 30_000;
 export const toolResultMarker = "\n[Tool result truncated to fit context budget]";
 export const textMarker = "\n[History text truncated to fit context budget]";
 
 // Byte-accurate cut: slices count UTF-16 units, so a character slice can overshoot a byte
-// budget by up to 4x on multibyte text. Back up to the previous UTF-8 character boundary
+// budget by up to 3x on multibyte text. Back up to the previous UTF-8 character boundary
 // before decoding so we never emit replacement characters.
 export function cut(value: string, bytes: number): string {
   const buf = Buffer.from(value, "utf8");

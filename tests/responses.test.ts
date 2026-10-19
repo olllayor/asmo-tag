@@ -328,6 +328,20 @@ describe("Responses provider boundary", () => {
     expect(tail.content).toContain("\\u003c/evidence");
   });
 
+  it("keeps history when dropping tail evidence is enough to fit", async () => {
+    let captured: Record<string, unknown> = {};
+    const provider = model(async (_url, request) => { captured = JSON.parse(String(request?.body)); return response([message("Done.")]); });
+    const history: Transcript[] = Array.from({ length: 20 }, (_, i) => ([
+      { role: "assistant" as const, content: [{ type: "tool_use" as const, id: `call-${i}`, name: "github_read_issues" as const, input: { repository: "acme/checkout" } }] },
+      { role: "user" as const, content: [{ type: "tool_result" as const, tool_use_id: `call-${i}`, content: "x".repeat(2_000), is_error: false }] },
+    ])).flat();
+    const sources = Array.from({ length: 30 }, (_, i) => ({ id: `src-${i}`, scopeId: "scope-1", text: "s".repeat(2_000), revision: 1, messageId: i, capturedAt: i, kind: "message" as const }));
+    const turn = await provider.turn({ ...input(history), sources }, signal());
+    expect(turn.outcome).toBe("complete");
+    expect(Buffer.byteLength(JSON.stringify(captured))).toBeLessThanOrEqual(100_000);
+    expect(JSON.stringify(captured.input)).toContain("call-0");
+  });
+
   it("trims mixed tool result and text entries instead of failing the task", async () => {
     let captured: Record<string, unknown> = {};
     const provider = model(async (_url, request) => { captured = JSON.parse(String(request?.body)); return response(); });
