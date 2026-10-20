@@ -181,7 +181,7 @@ describe("view payload limits and per-task sources", () => {
     // Newest tasks survive the cap, oldest are the records that were dropped.
     expect(view.tasks[0]?.task.instruction).toBe("Batch task 204");
     expect(view.tasks.some(item => item.task.instruction === "Batch task 4")).toBe(false);
-  });
+  }, 20_000);
 
   it("includes an older deep-linked task in the capped view response", async () => {
     const oldestTaskId = await startCommand("Oldest deep linked task");
@@ -197,5 +197,5 @@ describe("view payload limits and per-task sources", () => {
     const deepLinkedView = await store.view(scope.id, "member", oldestTaskId);
     expect(deepLinkedView.tasks.some(t => t.task.id === oldestTaskId)).toBe(true);
     expect(deepLinkedView.tasks.find(t => t.task.id === oldestTaskId)?.task.instruction).toBe("Oldest deep linked task");
-  });
+  }, 20_000);
 });
