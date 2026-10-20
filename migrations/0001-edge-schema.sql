@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS events (
  workspace_id TEXT NOT NULL, scope_id TEXT NOT NULL, task_id TEXT, id TEXT NOT NULL, data TEXT NOT NULL CHECK(json_valid(data)),
  PRIMARY KEY(workspace_id,id), FOREIGN KEY(workspace_id,scope_id) REFERENCES scopes(workspace_id,id), FOREIGN KEY(workspace_id,scope_id,task_id) REFERENCES tasks(workspace_id,scope_id,id)
 );
+CREATE INDEX IF NOT EXISTS events_task ON events(workspace_id,task_id);
 CREATE TABLE IF NOT EXISTS memories (
  workspace_id TEXT NOT NULL, scope_id TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL CHECK(json_valid(data)),
  PRIMARY KEY(workspace_id,id), FOREIGN KEY(workspace_id,scope_id) REFERENCES scopes(workspace_id,id)
@@ -103,4 +104,4 @@ CREATE TABLE IF NOT EXISTS dispatches (
  workspace_id TEXT NOT NULL, scope_id TEXT NOT NULL, task_id TEXT NOT NULL, effect_id TEXT NOT NULL, token TEXT NOT NULL,
  PRIMARY KEY(workspace_id,token), FOREIGN KEY(workspace_id,scope_id,task_id,effect_id) REFERENCES effects(workspace_id,scope_id,task_id,id)
 );
-INSERT INTO asmo_schema_meta(name,version) VALUES('schema',2) ON CONFLICT(name) DO UPDATE SET version=MAX(asmo_schema_meta.version,excluded.version);
+INSERT INTO asmo_schema_meta(name,version) VALUES('schema',3) ON CONFLICT(name) DO UPDATE SET version=MAX(asmo_schema_meta.version,excluded.version);
