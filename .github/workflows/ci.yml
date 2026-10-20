@@ -18,15 +18,17 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Nothing here pushes, so the token never needs to outlive the checkout.
           persist-credentials: false
 
       # pnpm version comes from the packageManager field in package.json.
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
 
-      - uses: actions/setup-node@v4
+      # `cache: pnpm` stays explicit. Since setup-node v6 the automatic default
+      # covers npm only, so dropping this line would silently stop caching.
+      - uses: actions/setup-node@v7
         with:
           # Matches engines.node in package.json.
           node-version: 22.22.0
