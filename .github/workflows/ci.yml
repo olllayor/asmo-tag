@@ -42,6 +42,7 @@ jobs:
       - run: pnpm build
       - run: pnpm web:build
 
-      # Bundles the edge worker so a broken binding or a stale route fails here
-      # instead of at deploy time.
+      # Offline check: bundles the worker and resolves every binding in
+      # wrangler.jsonc, so a bad binding name or a broken import fails here.
+      # It does not confirm the remote resources still exist.
       - run: pnpm edge:check
