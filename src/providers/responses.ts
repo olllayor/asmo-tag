@@ -5,6 +5,7 @@ import { contextCoverageLimitation } from "../conversation.js";
 import { id, toolCallSchema, toolInputs, turnSchema } from "../core.js";
 import type { ModelProvider, Transcript, Turn } from "../core.js";
 import { bound, maxTextBytes, maxToolResultBytes, textMarker, toolResultMarker } from "../limits.js";
+import { defaultStructuredSummarizer } from "../context/compaction.js";
 import { citedSourceIds, modelInputSchema, responseFormattingInstructions, toolDescriptions } from "./input.js";
 import { resolveProviderProfile, responsesOptionsSchema } from "./provider-config.js";
 
@@ -150,9 +151,17 @@ export function createResponsesModel(rawOptions: ResponsesOptions): ModelProvide
       let instructionTrimmed = false;
       let bounded = false;
 
+      // A task that overflowed before carries a summary of the entries it dropped. Sending the
+      // same short prefix on later turns is what keeps the cache hit instead of re-dropping a
+      // different window each turn.
+      const priorCompaction = input.task.compaction;
+      let summary = priorCompaction?.summary ?? null;
+      let compaction: { entries: number; summary: string } | undefined;
+      const droppedEntries: Transcript[] = [];
+
       // Lossy bounds are applied before any budget check and depend only on the stored entry, so
       // an entry that survives keeps the same bytes on every turn.
-      let effectiveHistory = input.history.map(entry => {
+      let effectiveHistory = input.history.slice(priorCompaction?.entries ?? 0).map(entry => {
         let changed = false;
         const content = entry.content.map(block => {
           if (block.type === "tool_result" && Buffer.byteLength(block.content) > maxToolResultBytes) {
@@ -178,7 +187,7 @@ export function createResponsesModel(rawOptions: ResponsesOptions): ModelProvide
         truncatedContext = true;
       }
 
-      const buildBody = (hist: Transcript[], mems: typeof effectiveMemories, srcs: typeof effectiveSources): ResponseCreateParamsNonStreaming => {
+      const buildBody = (hist: Transcript[], mems: typeof effectiveMemories, srcs: typeof effectiveSources, summaryText: string | null): ResponseCreateParamsNonStreaming => {
         const evidence = JSON.stringify({
           collectedSince: new Date(input.collectedSince).toISOString(),
           coverage: "Only a bounded selection of supplied sources is available. Omitted sources do not prove that an event never occurred. Uncaptured history is unavailable.",
@@ -188,6 +197,7 @@ export function createResponsesModel(rawOptions: ResponsesOptions): ModelProvide
           model: options.model, max_output_tokens: input.maxOutputTokens, stream: false,
           instructions: `${instructions}\nCurrent task instruction:\n${taskInstruction}`,
           input: [
+            ...(summaryText ? [{ role: "user" as const, content: `Earlier context, summarized:\n${summaryText}` }] : []),
             ...(hist.length ? historyItems(hist, identity) : [{ role: "user" as const, content: taskInstruction }]),
             { role: "user" as const, content: `<evidence>\n${evidence}\n</evidence>` },
           ],
@@ -199,21 +209,21 @@ export function createResponsesModel(rawOptions: ResponsesOptions): ModelProvide
         };
       };
 
-      let body = buildBody(effectiveHistory, effectiveMemories, effectiveSources);
+      let body = buildBody(effectiveHistory, effectiveMemories, effectiveSources, summary);
       let bodyBytes = Buffer.byteLength(JSON.stringify(body));
 
       if (bodyBytes > options.maxRequestBytes) {
         while (bodyBytes > options.maxRequestBytes && effectiveMemories.length > 0) {
           effectiveMemories = effectiveMemories.slice(1);
           truncatedContext = true;
-          body = buildBody(effectiveHistory, effectiveMemories, effectiveSources);
+          body = buildBody(effectiveHistory, effectiveMemories, effectiveSources, summary);
           bodyBytes = Buffer.byteLength(JSON.stringify(body));
         }
 
         while (bodyBytes > options.maxRequestBytes && effectiveSources.length > 0) {
           effectiveSources = effectiveSources.slice(1);
           truncatedContext = true;
-          body = buildBody(effectiveHistory, effectiveMemories, effectiveSources);
+          body = buildBody(effectiveHistory, effectiveMemories, effectiveSources, summary);
           bodyBytes = Buffer.byteLength(JSON.stringify(body));
         }
       }
@@ -261,9 +271,27 @@ export function createResponsesModel(rawOptions: ResponsesOptions): ModelProvide
             dropCount++;
           }
           if (dropCount === 0) break;
-          effectiveHistory = effectiveHistory.slice(built[dropCount - 1]!.at(-1)! + 1);
+          const keepFrom = built[dropCount - 1]!.at(-1)! + 1;
+          droppedEntries.push(...effectiveHistory.slice(0, keepFrom));
+          effectiveHistory = effectiveHistory.slice(keepFrom);
           truncatedContext = true;
-          body = buildBody(effectiveHistory, effectiveMemories, effectiveSources);
+          body = buildBody(effectiveHistory, effectiveMemories, effectiveSources, summary);
+          bodyBytes = Buffer.byteLength(JSON.stringify(body));
+        }
+
+        // Replace what the ladder dropped with one summary, so later turns send the summary
+        // instead of leaking context and re-dropping a different window each turn.
+        if (droppedEntries.length > 0) {
+          const messages = [
+            ...(priorCompaction ? [{ role: "user" as const, content: priorCompaction.summary }] : []),
+            ...droppedEntries.map(entry => ({
+              role: entry.role,
+              content: entry.content.map(block => block.type === "text" ? block.text : block.type === "tool_result" ? block.content : JSON.stringify({ call: block.name, input: block.input })).join("\n"),
+            })),
+          ];
+          summary = bound(await defaultStructuredSummarizer(messages), 4_000, "\n[Summary truncated to fit the context budget]");
+          compaction = { entries: (priorCompaction?.entries ?? 0) + droppedEntries.length, summary };
+          body = buildBody(effectiveHistory, effectiveMemories, effectiveSources, summary);
           bodyBytes = Buffer.byteLength(JSON.stringify(body));
         }
       }
@@ -312,6 +340,7 @@ export function createResponsesModel(rawOptions: ResponsesOptions): ModelProvide
           ...(!incomplete && !refusal && content.length ? { providerState: { protocol: "responses", ...identity, items: response.output } } : {}),
         },
         outcome, sourceIds: citedSourceIds(text, input.sources.map(source => source.id)), limitations,
+        ...(compaction ? { compaction } : {}),
         usage: { inputTokens: response.usage.input_tokens, outputTokens: response.usage.output_tokens, cachedInputTokens: cached, cachedInputReported, reasoningOutputTokens: reasoning, costMicros, simulated: false, pricingRevision: `configured:${profile.provider}:${options.model}:${options.inputUsdPerMillion}:${options.cachedInputUsdPerMillion}:${options.outputUsdPerMillion}` },
         requestId: response.id,
       });

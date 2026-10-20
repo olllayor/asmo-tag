@@ -78,6 +78,9 @@ export const taskSchema = z.object({
   result: answerSchema.nullable(),
   reason: z.string().nullable(),
   createdAt: z.number(),
+  // Set once a request overflows. The dropped head of the transcript is replaced by a summary so
+  // later turns send one stable, short prefix instead of dropping a different window each turn.
+  compaction: z.object({ entries: z.number().int().nonnegative(), summary: z.string() }).optional(),
 });
 export type Task = z.infer<typeof taskSchema>;
 
@@ -138,6 +141,7 @@ export const turnSchema = z.object({
   outcome: z.enum(['complete', 'tools', 'needs_input', 'incomplete']),
   sourceIds: z.array(id),
   limitations: z.array(z.string()),
+  compaction: z.object({ entries: z.number().int().positive(), summary: z.string().min(1) }).optional(),
 });
 export type Turn = z.infer<typeof turnSchema>;
 export const effectSchema = z.object({
