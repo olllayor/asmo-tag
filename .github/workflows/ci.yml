@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    # Pinned so a runner image change cannot silently move the toolchain.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Nothing here pushes, so the token never needs to outlive the checkout.
+          persist-credentials: false
+
+      # pnpm version comes from the packageManager field in package.json.
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Matches engines.node in package.json.
+          node-version: 22.22.0
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile --prefer-offline
+
+      - run: pnpm check
+      - run: pnpm web:check
+      - run: pnpm test
+      - run: pnpm build
+      - run: pnpm web:build
+
+      # Bundles the edge worker so a broken binding or a stale route fails here
+      # instead of at deploy time.
+      - run: pnpm edge:check

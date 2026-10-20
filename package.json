@@ -21,7 +21,8 @@
     "web:check": "tsc -p web/tsconfig.json",
     "check": "tsc --noEmit",
     "test": "vitest run",
-    "build": "tsc -p tsconfig.build.json"
+    "build": "tsc -p tsconfig.build.json",
+    "edge:check": "wrangler deploy --dry-run --outdir dist/edge"
   },
   "dependencies": {
     "abort-controller": "3.0.0",
