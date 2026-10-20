@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    # Pinned so a runner image change cannot silently move the toolchain.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Nothing here pushes, so the token never needs to outlive the checkout.
+          persist-credentials: false
+
+      # pnpm version comes from the packageManager field in package.json.
+      - uses: pnpm/action-setup@v6
+
+      # `cache: pnpm` stays explicit. Since setup-node v6 the automatic default
+      # covers npm only, so dropping this line would silently stop caching.
+      - uses: actions/setup-node@v7
+        with:
+          # Matches engines.node in package.json.
+          node-version: 22.22.0
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile --prefer-offline
+
+      - run: pnpm check
+      - run: pnpm web:check
+      - run: pnpm test
+      - run: pnpm build
+      - run: pnpm web:build
+
+      # Offline check: bundles the worker and resolves every binding in
+      # wrangler.jsonc, so a bad binding name or a broken import fails here.
+      # It does not confirm the remote resources still exist.
+      - run: pnpm edge:check
