@@ -17,7 +17,7 @@ flowchart LR
   Catalog[Reviewed OAuth / MCP / plugin catalog] --> UI
 ```
 
-Asmo owns the OAuth callbacks, encrypted vault, lifecycle checks, and typed tool adapters. GitHub and Notion credentials stay on the Asmo server. Later providers can add reviewed catalog entries without changing account-linking UI conventions. MCP and plugins are unavailable catalog entries in this implementation. The catalog does not load arbitrary manifests, connect to user-supplied servers, or execute remote code.
+Asmo owns the OAuth callbacks, encrypted vault, lifecycle checks, and typed tool adapters. GitHub and Notion credentials stay on the Asmo server. Later providers can add reviewed catalog entries without changing account-linking UI conventions. MCP and plugins are unavailable catalog entries in this implementation. The catalog does not load arbitrary manifests, connect to user-supplied servers, or execute remote code. (For the architectural decision on third-party plugin and skill script execution, see [`plugin-runtime-decision.md`](plugin-runtime-decision.md).)
 
 ### A connector gateway provider
 
