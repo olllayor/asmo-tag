@@ -24,6 +24,7 @@ export async function openApplication(config: Config) {
     const messenger = config.mode === "fixture" ? createFixtureMessenger(join(config.fixtureDirectory, "deliveries")) : createTelegramMessenger(config.botToken, config.miniAppLink);
     const bot = config.mode === "fixture" ? fixtureBot : await new Api(config.botToken).getMe().then(me => ({ id: String(me.id), username: me.username }));
     const authority = config.mode === "live" ? new TelegramAuthority(config.botToken, bot.id, store) : null;
+    if (authority && "bindAuthority" in store && typeof store.bindAuthority === "function") store.bindAuthority(authority);
     integrations = new IntegrationService({ databasePath: config.databasePath, ...(config.mode === "live" ? config.integrations : {}), authorize: async (actorId, context, action) => {
       try {
         const scope = (await store.scopes(actorId)).find(item => item.id === context.scopeId && item.workspaceId === context.workspaceId);

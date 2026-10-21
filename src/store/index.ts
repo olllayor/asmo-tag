@@ -12,7 +12,7 @@ import {
   turnSchema, toolCallSchema, workspaceViewSchema,
 } from "../core.js";
 import type {
-  Approval, AuditEvent, Command, CommandInput, ConnectorReceipt, Delivery, Effect, Grant,
+  Approval, AuditEvent, AuthorityVerifier, Command, CommandInput, ConnectorReceipt, Delivery, Effect, Grant,
   Job, Memory, ModelInput, NormalizedUpdate, Receipt, Routine, Scope, Seed, Source, Store,
   StoreOptions, Task, TaskView, ToolCall, ToolName, Transcript, Turn, WorkspaceView,
 } from "../core.js";
@@ -187,11 +187,13 @@ function assertBackend(options: StoreOptions): void {
 
 class SQLiteStore implements Store {
   readonly connection: Connection | D1Connection;
+  private authority: AuthorityVerifier | null = null;
   readonly options: StoreOptions;
   readonly now: () => number;
   readonly passiveCaps: { sourceLimit: number; floodWindowMs: number; floodMaxCaptures: number };
   constructor(options: StoreOptions, connection: Connection | D1Connection) {
     this.options = options;
+    this.authority = options.authority ?? null;
     this.now = options.clock ?? Date.now;
     this.connection = connection;
     this.passiveCaps = {
@@ -204,6 +206,9 @@ class SQLiteStore implements Store {
   // node:sqlite/node:fs and must never load on the edge), and to the full
   // BEGIN IMMEDIATE transaction on Node. The dynamic import below is only ever
   // reached on the local-SQLite path; bundlers keep it a separate chunk.
+  bindAuthority(authority: AuthorityVerifier): void {
+    this.authority = authority;
+  }
   async isolated<T>(operation: () => Promise<T>): Promise<T> {
     const connection = this.connection;
     if ("isD1" in connection && connection.isD1) {
@@ -951,6 +956,39 @@ class SQLiteStore implements Store {
     if (grants.some(grant => grant.kind === "notion_scope" && grant.read)) tools.push("notion_search", "notion_read_page");
     return { task, history: await history(db, task.id), sources, memories, collectedSince: scope.collectedSince, tools, maxOutputTokens: this.options.maxOutputTokens };
   }
+  private async refreshAuthorityForCandidate(candidate: { workspace_id: string; scope_id: string; task_id: string | null; entity_id: string; kind: "model" | "effect" | "delivery" }): Promise<{ botValid: boolean }> {
+    if (!this.authority) return { botValid: true };
+    let botValid = true;
+    const scopes = await this.connection.discover("SELECT data FROM scopes WHERE workspace_id=$1 AND id=$2", [candidate.workspace_id, candidate.scope_id], z.object({ data: scopeSchema }));
+    const scope = scopes[0]?.data;
+    if (!scope) return { botValid: true };
+    if (scope.kind === "group" && this.authority.botAdmin) {
+      try {
+        await this.authority.botAdmin(scope.chatId);
+      } catch {
+        botValid = false;
+      }
+    }
+    if (candidate.task_id) {
+      const taskRows = await this.connection.discover("SELECT data FROM tasks WHERE workspace_id=$1 AND id=$2", [candidate.workspace_id, candidate.task_id], z.object({ data: taskSchema }));
+      const task = taskRows[0]?.data;
+      if (task && !task.requesterId.startsWith("routine:")) {
+        try {
+          await this.authority.refresh(scope, task.requesterId);
+        } catch {}
+      }
+    }
+    if (candidate.kind === "effect") {
+      const approvalRows = await this.connection.discover("SELECT data FROM approvals WHERE workspace_id=$1 AND effect_id=$2", [candidate.workspace_id, candidate.entity_id], z.object({ data: approvalSchema }));
+      const approval = approvalRows[0]?.data;
+      if (approval?.decidedBy) {
+        try {
+          await this.authority.refresh(scope, approval.decidedBy);
+        } catch {}
+      }
+    }
+    return { botValid };
+  }
   async claim(workerId: string, kind?: Job["kind"]): Promise<Job | null> {
     // Held jobs are not claim candidates, so a worker that only polls one kind still has to
     // run the release sweep or jobs of that kind never come back. materializeRoutines()
@@ -959,11 +997,12 @@ class SQLiteStore implements Store {
     if (kind === "delivery") await this.releaseHeldJobs();
     else await this.materializeRoutines();
     for (let attempt = 0; attempt < 40; attempt += 1) {
+      const candidates = await this.connection.discover("SELECT workspace_id,scope_id,id,kind,task_id,entity_id FROM jobs WHERE ($2 IS NULL OR workspace_id IN (SELECT value FROM json_each($2))) AND ($3 IS NULL OR kind=$3) AND ((state='ready' AND ready_at<=$1) OR (state='leased' AND expires_at<=$1)) ORDER BY CASE kind WHEN 'effect' THEN 0 WHEN 'delivery' THEN 1 ELSE 2 END,ready_at LIMIT 1", [this.now(), this.options.workspaceIds ?? null, kind ?? null], locationSchema.extend({ id: z.string(), kind: z.enum(["model", "effect", "delivery"]), task_id: z.string().nullable(), entity_id: z.string() }));
+      const location = candidates[0];
+      if (!location) return null;
+      const { botValid } = await this.refreshAuthorityForCandidate(location);
       const token = uuid();
       const job = await this.isolated(async (): Promise<Job | null | undefined> => {
-        const candidates = await this.connection.discover("SELECT workspace_id,scope_id,id FROM jobs WHERE ($2 IS NULL OR workspace_id IN (SELECT value FROM json_each($2))) AND ($3 IS NULL OR kind=$3) AND ((state='ready' AND ready_at<=$1) OR (state='leased' AND expires_at<=$1)) ORDER BY CASE kind WHEN 'effect' THEN 0 WHEN 'delivery' THEN 1 ELSE 2 END,ready_at LIMIT 1", [this.now(), this.options.workspaceIds ?? null, kind ?? null], locationSchema.extend({ id: z.string() }));
-        const location = candidates[0];
-        if (!location) return undefined;
         const db = this.connection.context(location.workspace_id);
         const scope = first(await records(db, "scopes", scopeSchema, "id=$1", [location.scope_id]));
         // The guard makes the lease a compare-and-swap. D1 has no interactive transaction to
@@ -978,7 +1017,7 @@ class SQLiteStore implements Store {
         const task = row.task_id ? await taskRecord(db, scope.id, row.task_id) : null;
         if (row.kind === "delivery") {
           const delivery = deliverySchema.parse(row.data);
-          if (!scope.active || (task && !await this.requesterAllowed(db, scope, task))) { await db.query("UPDATE jobs SET state='held' WHERE workspace_id=$workspace AND id=$1", [row.id]); await event(db, scope, task?.id ?? null, null, "delivery_held", { reason: "Current destination or requester access unavailable." }, this.now()); return null; }
+          if (!scope.active || !botValid || (task && !await this.requesterAllowed(db, scope, task))) { await db.query("UPDATE jobs SET state='held' WHERE workspace_id=$workspace AND id=$1", [row.id]); await event(db, scope, task?.id ?? null, null, "delivery_held", { reason: botValid ? "Current destination or requester access unavailable." : "Bot administrator access unavailable." }, this.now()); return null; }
           if (delivery.purpose === "progress" && task && task.state !== "queued" && task.state !== "running") {
             if (delivery.messageId === null) { await db.query("UPDATE jobs SET state='done' WHERE workspace_id=$workspace AND id=$1", [row.id]); return null; }
             delivery.buttons = []; delivery.text = settledProgress(task);
@@ -994,12 +1033,12 @@ class SQLiteStore implements Store {
             await save(db, "effects", effect);
             return { kind: "effect", lease, effect, reconcile: true };
           }
-          let allowed = effect.state === "ready" && await this.effectAllowed(db, scope, task, effect);
+          let allowed = botValid && effect.state === "ready" && await this.effectAllowed(db, scope, task, effect);
           if (allowed && effect.call.name === "github_create_issue") {
             const approval = (await records(db, "approvals", approvalSchema, "effect_id=$1", [effect.id]))[0];
             allowed = Boolean(approval && approval.state === "approved" && approval.expiresAt > this.now() && approval.hash === effect.hash && approval.decidedBy && manager(await roleFor(db, scope.id, approval.decidedBy)) && digest(effect.call) === effect.hash);
           }
-          if (!allowed) { await save(db, "effects", { ...effect, state: effect.state === "succeeded" ? "succeeded" : "denied", result: effect.result ?? "Current authorization denies dispatch.", reason: "Current authorization denies dispatch." }); await db.query("UPDATE jobs SET state='done' WHERE workspace_id=$workspace AND id=$1", [row.id]); await this.advance(db, scope, task); return null; }
+          if (!allowed) { const reason = botValid ? "Current authorization denies dispatch." : "Bot administrator access unavailable."; await save(db, "effects", { ...effect, state: effect.state === "succeeded" ? "succeeded" : "denied", result: effect.result ?? reason, reason }); await db.query("UPDATE jobs SET state='done' WHERE workspace_id=$workspace AND id=$1", [row.id]); await this.advance(db, scope, task); return null; }
           const dispatched: Effect = { ...effect, state: "dispatching", reason: null };
           await save(db, "effects", dispatched);
           await db.query("INSERT INTO dispatches(workspace_id,scope_id,task_id,effect_id,token) VALUES($1,$2,$3,$4,$5)", [scope.workspaceId, scope.id, task.id, effect.id, token]);
@@ -1009,7 +1048,7 @@ class SQLiteStore implements Store {
         await this.expireReservations(db, scope, task, token);
         const activeModels = first(await rows(db, "SELECT count(*) AS count FROM jobs WHERE workspace_id=$workspace AND scope_id=$1 AND kind='model' AND state='leased' AND expires_at>$2", [scope.id, this.now()], z.object({ count: z.coerce.number().int() }))).count;
         if (activeModels > modelLeaseLimitPerScope) { await db.query("UPDATE jobs SET state='ready',ready_at=$2,token=NULL,worker_id=NULL,expires_at=NULL WHERE workspace_id=$workspace AND id=$1 AND token=$3", [row.id, this.now() + deferredClaimMs, token]); return null; }
-        const resumableBlocked = task.state === "blocked" && task.reason !== "Task turn limit reached."; if (!scope.active || (!liveStates.has(task.state) && !resumableBlocked) || !await this.requesterAllowed(db, scope, task)) { await db.query("UPDATE jobs SET state='held' WHERE workspace_id=$workspace AND id=$1", [row.id]); if (liveStates.has(task.state) || task.state === "blocked") await save(db, "tasks", { ...task, state: "blocked", reason: "Current scope or requester access unavailable." }); await this.advance(db, scope, task); return null; }
+        const resumableBlocked = task.state === "blocked" && task.reason !== "Task turn limit reached."; if (!scope.active || !botValid || (!liveStates.has(task.state) && !resumableBlocked) || !await this.requesterAllowed(db, scope, task)) { const reason = botValid ? "Current scope or requester access unavailable." : "Bot administrator access unavailable."; await db.query("UPDATE jobs SET state='held' WHERE workspace_id=$workspace AND id=$1", [row.id]); if (liveStates.has(task.state) || task.state === "blocked") await save(db, "tasks", { ...task, state: "blocked", reason }); await this.advance(db, scope, task); return null; }
         if (!await this.completeToolResults(db, scope, task)) { await db.query("UPDATE jobs SET state='held' WHERE workspace_id=$workspace AND id=$1", [row.id]); const effects = await records(db, "effects", effectSchema, "task_id=$1 AND data->>'state'='unknown'", [task.id]); if (effects.length) await save(db, "tasks", { ...task, state: "blocked", reason: "External outcome unknown. Reconciliation required." }); return null; }
         await this.flushNotes(db, task);
         const workspace = first(await rows(db, "SELECT budget,held,spent,authority_revision FROM workspaces WHERE id=$workspace AND id=$1", [scope.workspaceId], workspaceRowSchema));

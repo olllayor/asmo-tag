@@ -364,6 +364,11 @@ export interface Messenger {
   send(delivery: Delivery, signal: AbortSignal): Promise<{ messageId: number }>;
 }
 export type Lease = { id: string; token: string; workerId: string; expiresAt: number };
+export interface AuthorityVerifier {
+  refresh(scope: Scope, userId: string): Promise<void>;
+  botAdmin?(chatId: string): Promise<void>;
+}
+
 export type Job =
   | { kind: 'model'; lease: Lease; input: ModelInput }
   | { kind: 'effect'; lease: Lease; effect: Effect; reconcile: boolean }
@@ -388,6 +393,7 @@ export interface Store {
   absentEffect(job: Extract<Job, { kind: 'effect' }>, proof: string): Promise<void>;
   finishDelivery(job: Extract<Job, { kind: 'delivery' }>, messageId: number): Promise<void>;
   fail(job: Job, reason: string): Promise<void>;
+  bindAuthority?(authority: AuthorityVerifier): void;
   close(): Promise<void>;
 }
 export type StoreOptions = {
@@ -404,6 +410,7 @@ export type StoreOptions = {
   passiveSourceLimitPerScope?: number;
   passiveFloodWindowMs?: number;
   passiveFloodMaxCaptures?: number;
+  authority?: AuthorityVerifier;
 };
 
 // Routine scheduling runs on wall-clock intent. A routine stores an IANA timezone and a
