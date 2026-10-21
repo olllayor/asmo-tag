@@ -364,9 +364,11 @@ export interface Messenger {
   send(delivery: Delivery, signal: AbortSignal): Promise<{ messageId: number }>;
 }
 export type Lease = { id: string; token: string; workerId: string; expiresAt: number };
+// Current Telegram authority for an actor. Both checks reject when the answer is anything
+// but a confirmed yes, so callers can treat a rejection as a denial.
 export interface AuthorityVerifier {
   refresh(scope: Scope, userId: string): Promise<void>;
-  botAdmin?(chatId: string): Promise<void>;
+  botAdmin(chatId: string): Promise<void>;
 }
 
 export type Job =
@@ -393,7 +395,7 @@ export interface Store {
   absentEffect(job: Extract<Job, { kind: 'effect' }>, proof: string): Promise<void>;
   finishDelivery(job: Extract<Job, { kind: 'delivery' }>, messageId: number): Promise<void>;
   fail(job: Job, reason: string): Promise<void>;
-  bindAuthority?(authority: AuthorityVerifier): void;
+  bindAuthority(authority: AuthorityVerifier): void;
   close(): Promise<void>;
 }
 export type StoreOptions = {
@@ -410,7 +412,6 @@ export type StoreOptions = {
   passiveSourceLimitPerScope?: number;
   passiveFloodWindowMs?: number;
   passiveFloodMaxCaptures?: number;
-  authority?: AuthorityVerifier;
 };
 
 // Routine scheduling runs on wall-clock intent. A routine stores an IANA timezone and a

@@ -44,7 +44,7 @@ describe("Execution and delivery current-member verification", () => {
       }),
       botAdmin: vi.fn(async () => {}),
     };
-    store.bindAuthority?.(authority);
+    store.bindAuthority(authority);
 
     await store.command({
       scopeId: "engineering",
@@ -88,7 +88,7 @@ describe("Execution and delivery current-member verification", () => {
         throw new Error("Asmo needs administrator membership for reliable member checks.");
       }),
     };
-    store.bindAuthority?.(authority);
+    store.bindAuthority(authority);
 
     await store.command({
       scopeId: "engineering",
@@ -171,7 +171,7 @@ describe("Execution and delivery current-member verification", () => {
       }),
       botAdmin: vi.fn(async () => {}),
     };
-    store.bindAuthority?.(authority);
+    store.bindAuthority(authority);
 
     const connector = {
       simulated: true,
@@ -245,7 +245,7 @@ describe("Execution and delivery current-member verification", () => {
       }),
       botAdmin: vi.fn(async () => {}),
     };
-    store.bindAuthority?.(authority);
+    store.bindAuthority(authority);
 
     const connector = {
       simulated: true,
@@ -287,7 +287,7 @@ describe("Execution and delivery current-member verification", () => {
       }),
       botAdmin: vi.fn(async () => {}),
     };
-    store.bindAuthority?.(authority);
+    store.bindAuthority(authority);
 
     const modelTurn = vi.fn(async () => ({}) as unknown as Turn);
     const worker = new Worker(
@@ -307,12 +307,45 @@ describe("Execution and delivery current-member verification", () => {
     expect(task?.task.reason).toBe("Current scope or requester access unavailable.");
   });
 
+  it("holds delivery when the membership check cannot run", async () => {
+    const authority: AuthorityVerifier = {
+      // Capacity exhaustion or a Telegram failure rejects without persisting a demotion.
+      // Execution must not fall back to the stored role when the check could not run.
+      refresh: vi.fn(async () => { throw new Error("Membership check capacity reached."); }),
+      botAdmin: vi.fn(async () => {}),
+    };
+    store.bindAuthority(authority);
+
+    await store.command({
+      scopeId: "engineering",
+      userId: "101",
+      key: "delivery-test-unavailable",
+      command: { kind: "start", instruction: "Do something", topicId: null },
+    });
+
+    const messenger = { simulated: true, send: vi.fn(async () => ({ messageId: 9999 })) };
+    const worker = new Worker(
+      store,
+      { simulated: true, turn: async () => ({}) as unknown as Turn },
+      { simulated: true, invoke: async () => ({ providerId: "p", url: null, content: "" }), reconcile: async () => ({ kind: "found", receipt: { providerId: "p", url: null, content: "" } }) },
+      messenger
+    );
+
+    const worked = await worker.step("delivery-worker", undefined, "delivery");
+    expect(worked).toBe(false);
+    expect(messenger.send).not.toHaveBeenCalled();
+
+    const view = await store.view("engineering", "102");
+    const task = view.tasks.find((t) => t.task.requesterId === "101");
+    expect(task?.events.some((event) => event.kind === "delivery_held")).toBe(true);
+  });
+
   it("executes effect and delivers normally when current authority is verified and valid", async () => {
     const authority: AuthorityVerifier = {
       refresh: vi.fn(async () => {}),
       botAdmin: vi.fn(async () => {}),
     };
-    store.bindAuthority?.(authority);
+    store.bindAuthority(authority);
 
     const receipt = await store.command({
       scopeId: "engineering",
@@ -321,6 +354,23 @@ describe("Execution and delivery current-member verification", () => {
       command: { kind: "start", instruction: "Create issue", topicId: null },
     });
     const taskId = receipt.taskId!;
+
+    const connector = {
+      simulated: true,
+      invoke: vi.fn(async () => ({ providerId: "gh-123", url: "https://github.com/issue/123", content: "Created" })),
+      reconcile: vi.fn(async () => ({ kind: "found" as const, receipt: { providerId: "gh-123", url: "https://github.com/issue/123", content: "Created" } })),
+    };
+    const messenger = { simulated: true, send: vi.fn(async () => ({ messageId: 1 })) };
+    const worker = new Worker(
+      store,
+      { simulated: true, turn: async () => ({}) as unknown as Turn },
+      connector,
+      messenger
+    );
+
+    const delivered = await worker.step("delivery-worker", undefined, "delivery");
+    expect(delivered).toBe(true);
+    expect(messenger.send).toHaveBeenCalled();
 
     const modelJob = await store.claim("model-worker", "model");
     expect(modelJob).not.toBeNull();
@@ -354,18 +404,6 @@ describe("Execution and delivery current-member verification", () => {
       key: "decide-3",
       command: { kind: "decide", approvalId: approval.id, decision: "approve" },
     });
-
-    const connector = {
-      simulated: true,
-      invoke: vi.fn(async () => ({ providerId: "gh-123", url: "https://github.com/issue/123", content: "Created" })),
-      reconcile: vi.fn(async () => ({ kind: "found" as const, receipt: { providerId: "gh-123", url: "https://github.com/issue/123", content: "Created" } })),
-    };
-    const worker = new Worker(
-      store,
-      { simulated: true, turn: async () => ({}) as unknown as Turn },
-      connector,
-      { simulated: true, send: async () => ({ messageId: 1 }) }
-    );
 
     const worked = await worker.step("effect-worker", undefined, "effect");
     expect(worked).toBe(true);
