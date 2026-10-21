@@ -142,7 +142,7 @@ A Mission should publish one consolidated progress record. It should pause when 
 
 Turn the current catalog into an executable connector contract only after the initial flows work. The contract should define schemas, authentication, resource selection, read/write classification, credential access, timeouts, redaction, cost limits, and effect reconciliation.
 
-Installation should show what the connector can read, what it can change, and who can use it. Discovery through MCP does not grant execution permission. Version connector manifests and fence queued work when permissions or capabilities change.
+Installation should show what the connector can read, what it can change, and who can use it. Discovery through MCP does not grant execution permission. Version connector manifests and fence queued work when permissions or capabilities change. (The execution and approval boundary is decided in [plugin runtime decision](../engineering/plugin-runtime-decision.md).)
 
 Ship curated workflow packs before arbitrary downloadable code. Potential packs include bug triage, release preparation, and project catch-up. Add integrations such as Linear or Drive when pilot work demonstrates a need.
 
