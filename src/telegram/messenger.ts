@@ -212,7 +212,7 @@ export class TelegramAuthority {
     try { return await work(); } finally { this.active--; this.queued.shift()?.(); }
   }
 
-  private botAdmin(chatId: string): Promise<void> {
+  botAdmin(chatId: string): Promise<void> {
     const cached = this.bots.get(chatId);
     if (cached && Date.now() - cached.at < botTtlMs) return cached.promise;
     if (!cached && this.bots.size >= maxMemberEntries) {
