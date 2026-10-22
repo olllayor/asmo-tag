@@ -471,3 +471,4 @@ export function wallClockInstant(value: string, timeZone: string): number {
   const wallAsUtc = Date.UTC(Number(parsed[1]), Number(parsed[2]) - 1, Number(parsed[3]), Number(parsed[4]), Number(parsed[5]));
   return resolveWallClockInstant(wallAsUtc, timeZone);
 }
+

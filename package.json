@@ -25,6 +25,7 @@
   },
   "dependencies": {
     "abort-controller": "3.0.0",
+    "effect": "4.0.5",
     "grammy": "1.46.0",
     "openai": "7.28.0",
     "react": "19.3.0",
