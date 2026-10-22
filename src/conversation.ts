@@ -1,4 +1,4 @@
-import { Option, Result } from "effect";
+import { Option } from "effect";
 
 export function greetingReply(text: string): string | null {
   const greeting = text.trim().replace(/^@[a-z0-9_]+\s+/i, "").replace(/\s+@[a-z0-9_]+$/i, "").replace(/[.!?]+$/, "").trim().toLowerCase();
@@ -26,13 +26,4 @@ export function conversationAnswer(text: string, limitations: string[], collecte
   const relevant = limitations.filter(item => item !== contextCoverageLimitation(collectedSince));
   const answer = text.trim().replace(/^Needs input:\s*/, "");
   return [answer || "I couldn't produce an answer. Please try again.", ...relevant].join("\n\n");
-}
-
-// Effect v4 Result variant
-export function conversationAnswerResult(
-  text: string,
-  limitations: string[],
-  collectedSince: number
-): Result.Result<string, never> {
-  return Result.succeed(conversationAnswer(text, limitations, collectedSince));
 }

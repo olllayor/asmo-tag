@@ -8,6 +8,9 @@ import {
   MemorySchema,
   AnswerSchema,
   TaskSchema,
+  ToolResultBlockSchema,
+  TranscriptSchema,
+  ApprovalSchema,
   decodeScopeResult,
   decodeScopeSync,
   decodeSourceResult,
@@ -15,12 +18,15 @@ import {
   decodeAnswerResult,
   decodeTaskResult,
   decodeTaskSync,
+  decodeApprovalResult,
+  decodeTranscriptResult,
+  decodeBlockSync,
 } from "../src/core-effect.js";
-import { boundOption } from "../src/limits.js";
-import { greetingReplyOption, conversationAnswerResult } from "../src/conversation.js";
+import { truncateOption, boundOption } from "../src/limits.js";
+import { greetingReplyOption } from "../src/conversation.js";
 
 describe("Effect v4 Core Domain Schemas & Decoders", () => {
-  it("validates IdSchema bounds (1-128 chars)", () => {
+  it("validates IdSchema lower and upper bounds (1-128 chars)", () => {
     const valid = decodeScopeResult({
       id: "valid-id",
       workspaceId: "ws-1",
@@ -37,6 +43,7 @@ describe("Effect v4 Core Domain Schemas & Decoders", () => {
     });
     expect(Result.isSuccess(valid)).toBe(true);
 
+    // Empty string (< 1 char)
     const emptyId = decodeScopeResult({
       id: "",
       workspaceId: "ws-1",
@@ -54,6 +61,26 @@ describe("Effect v4 Core Domain Schemas & Decoders", () => {
     expect(Result.isFailure(emptyId)).toBe(true);
     if (Result.isFailure(emptyId)) {
       expect(emptyId.failure.message).toContain("length of at least 1");
+    }
+
+    // Over 128 chars
+    const oversizedId = decodeScopeResult({
+      id: "a".repeat(129),
+      workspaceId: "ws-1",
+      kind: "group",
+      chatId: "123",
+      ownerId: null,
+      name: "Test Group",
+      active: true,
+      workspacePublic: false,
+      timezone: "UTC",
+      policyRevision: 1,
+      collectedSince: 1000,
+      budgetMicros: 5000,
+    });
+    expect(Result.isFailure(oversizedId)).toBe(true);
+    if (Result.isFailure(oversizedId)) {
+      expect(oversizedId.failure.message).toContain("length of at most 128");
     }
   });
 
@@ -159,21 +186,145 @@ describe("Effect v4 Core Domain Schemas & Decoders", () => {
     expect(Result.isFailure(invalidBudget)).toBe(true);
   });
 
-  it("integrates Effect Option with boundOption in limits", () => {
+  it("decodes ToolResultBlock with is_error defaulting to false when omitted (Defect 2 parity)", () => {
+    const decoded = decodeBlockSync({
+      type: "tool_result",
+      tool_use_id: "tool-use-1",
+      content: "output data",
+    });
+
+    expect(decoded.type).toBe("tool_result");
+    if (decoded.type === "tool_result") {
+      expect(decoded.is_error).toBe(false);
+    }
+
+    const explicitTrue = decodeBlockSync({
+      type: "tool_result",
+      tool_use_id: "tool-use-1",
+      content: "failed execution",
+      is_error: true,
+    });
+    if (explicitTrue.type === "tool_result") {
+      expect(explicitTrue.is_error).toBe(true);
+    }
+  });
+
+  it("strictly rejects non-JSON values in ToolUseBlock input (Defect 3 parity)", () => {
+    const validJson = decodeBlockSync({
+      type: "tool_use",
+      id: "tool-1",
+      name: "notion_search",
+      input: { query: "Effect v4", count: 10 },
+    });
+    expect(validJson.type).toBe("tool_use");
+
+    // Function is not valid JSON
+    expect(() =>
+      decodeBlockSync({
+        type: "tool_use",
+        id: "tool-1",
+        name: "notion_search",
+        input: { fn: () => {} },
+      })
+    ).toThrow();
+  });
+
+  it("strictly rejects NaN and Infinity in timestamp fields (Defect 4 parity)", () => {
+    const nanScope = decodeScopeResult({
+      id: "scope-nan",
+      workspaceId: "ws-1",
+      kind: "group",
+      chatId: "123",
+      ownerId: null,
+      name: "NaN Test",
+      active: true,
+      workspacePublic: false,
+      timezone: "UTC",
+      policyRevision: 1,
+      collectedSince: NaN,
+      budgetMicros: 1000,
+    });
+    expect(Result.isFailure(nanScope)).toBe(true);
+
+    const infScope = decodeScopeResult({
+      id: "scope-inf",
+      workspaceId: "ws-1",
+      kind: "group",
+      chatId: "123",
+      ownerId: null,
+      name: "Inf Test",
+      active: true,
+      workspacePublic: false,
+      timezone: "UTC",
+      policyRevision: 1,
+      collectedSince: Infinity,
+      budgetMicros: 1000,
+    });
+    expect(Result.isFailure(infScope)).toBe(true);
+  });
+
+  it("enforces TranscriptSchema providerState items maximum limit of 128 (Defect 1 parity)", () => {
+    const validTranscript = decodeTranscriptResult({
+      role: "assistant",
+      content: [{ type: "text", text: "Ready." }],
+      providerState: {
+        protocol: "responses",
+        provider: "openai",
+        endpoint: "https://api.openai.com",
+        model: "gpt-4o",
+        items: new Array(128).fill({ role: "system" }),
+      },
+    });
+    expect(Result.isSuccess(validTranscript)).toBe(true);
+
+    const oversizedTranscript = decodeTranscriptResult({
+      role: "assistant",
+      content: [{ type: "text", text: "Ready." }],
+      providerState: {
+        protocol: "responses",
+        provider: "openai",
+        endpoint: "https://api.openai.com",
+        model: "gpt-4o",
+        items: new Array(129).fill({ role: "system" }),
+      },
+    });
+    expect(Result.isFailure(oversizedTranscript)).toBe(true);
+  });
+
+  it("decodes Approval schema and validates states", () => {
+    const approval = decodeApprovalResult({
+      id: "app-1",
+      taskId: "task-1",
+      effectId: "eff-1",
+      hash: "sha256-hash",
+      expiresAt: 1700000000000,
+      state: "pending",
+      decidedBy: null,
+    });
+    expect(Result.isSuccess(approval)).toBe(true);
+    if (Result.isSuccess(approval)) {
+      expect(approval.success.state).toBe("pending");
+    }
+  });
+
+  it("integrates Effect Option with truncateOption in limits (Defect 5 parity)", () => {
     // Fits in budget -> Option.none()
-    const fit = boundOption("short string", 100, " [cut]");
+    const fit = truncateOption("short string", 100, " [cut]");
     expect(Option.isNone(fit)).toBe(true);
 
     // Over budget -> Option.some(truncated)
-    const truncated = boundOption("very long string exceeding small budget", 15, " [cut]");
+    const truncated = truncateOption("very long string exceeding small budget", 15, " [cut]");
     expect(Option.isSome(truncated)).toBe(true);
     if (Option.isSome(truncated)) {
       expect(truncated.value).toContain("[cut]");
       expect(Buffer.byteLength(truncated.value)).toBeLessThanOrEqual(15);
     }
+
+    // Alias boundOption works identically
+    expect(Option.isNone(boundOption("short string", 100, " [cut]"))).toBe(true);
   });
 
-  it("integrates greetingReplyOption and conversationAnswerResult", () => {
+  it("integrates greetingReplyOption in conversation", () => {
     const greeting = greetingReplyOption("@asmo_ai_bot hi");
     expect(Option.isSome(greeting)).toBe(true);
     if (Option.isSome(greeting)) {
@@ -182,11 +333,5 @@ describe("Effect v4 Core Domain Schemas & Decoders", () => {
 
     const nonGreeting = greetingReplyOption("some random task instruction");
     expect(Option.isNone(nonGreeting)).toBe(true);
-
-    const answerRes = conversationAnswerResult("The task is complete", [], 0);
-    expect(Result.isSuccess(answerRes)).toBe(true);
-    if (Result.isSuccess(answerRes)) {
-      expect(answerRes.success).toBe("The task is complete");
-    }
   });
 });

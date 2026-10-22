@@ -5,7 +5,7 @@
  * Provides zero-runtime-dependency type decoding, encoding, and functional error handling.
  */
 
-import { Schema } from "effect";
+import { Schema, Effect } from "effect";
 
 // Base primitives
 export const IdSchema = Schema.String.pipe(
@@ -36,9 +36,9 @@ export const ScopeSchema = Schema.Struct({
   workspacePublic: Schema.Boolean,
   timezone: Schema.String,
   policyRevision: Schema.Int.pipe(Schema.check(Schema.isGreaterThan(0))),
-  collectedSince: Schema.Number,
+  collectedSince: Schema.Finite,
   budgetMicros: MicrosSchema,
-  captureBoundedAt: Schema.optional(Schema.NullOr(Schema.Number)),
+  captureBoundedAt: Schema.optional(Schema.NullOr(Schema.Finite)),
 });
 export type Scope = Schema.Schema.Type<typeof ScopeSchema>;
 
@@ -51,7 +51,7 @@ export const SourceSchema = Schema.Struct({
   text: Schema.String,
   revision: Schema.Int.pipe(Schema.check(Schema.isGreaterThan(0))),
   messageId: Schema.NullOr(Schema.Int),
-  capturedAt: Schema.Number,
+  capturedAt: Schema.Finite,
   kind: SourceKindSchema,
 });
 export type Source = Schema.Schema.Type<typeof SourceSchema>;
@@ -114,7 +114,7 @@ export const TaskSchema = Schema.Struct({
   budgetMicros: MicrosSchema,
   result: Schema.NullOr(AnswerSchema),
   reason: Schema.NullOr(Schema.String),
-  createdAt: Schema.Number,
+  createdAt: Schema.Finite,
   compaction: Schema.optional(CompactionSchema),
 });
 export type Task = Schema.Schema.Type<typeof TaskSchema>;
@@ -129,14 +129,14 @@ export const ToolUseBlockSchema = Schema.Struct({
   type: Schema.Literal("tool_use"),
   id: IdSchema,
   name: Schema.String,
-  input: Schema.Unknown,
+  input: Schema.Json,
 });
 
 export const ToolResultBlockSchema = Schema.Struct({
   type: Schema.Literal("tool_result"),
   tool_use_id: IdSchema,
   content: Schema.String,
-  is_error: Schema.optional(Schema.Boolean),
+  is_error: Schema.Boolean.pipe(Schema.optional, Schema.withDecodingDefault(Effect.succeed(false))),
 });
 
 export const BlockSchema = Schema.Union([
@@ -155,7 +155,7 @@ export const TranscriptSchema = Schema.Struct({
       provider: Schema.Literals(["openai", "deepseek"]),
       endpoint: Schema.String,
       model: Schema.String,
-      items: Schema.Array(Schema.Unknown).pipe(Schema.check(Schema.isMaxLength(128))),
+      items: Schema.Array(Schema.Json).pipe(Schema.check(Schema.isMaxLength(128))),
     })
   ),
 });
@@ -201,7 +201,7 @@ export const ApprovalSchema = Schema.Struct({
   taskId: IdSchema,
   effectId: IdSchema,
   hash: Schema.String,
-  expiresAt: Schema.Number,
+  expiresAt: Schema.Finite,
   state: ApprovalStateSchema,
   decidedBy: Schema.NullOr(Schema.String),
 });
@@ -246,3 +246,27 @@ export const decodeTurnResult = (data: unknown) =>
 
 export const decodeTurnSync = (data: unknown): Turn =>
   Schema.decodeUnknownSync(TurnSchema)(data);
+
+export const decodeApprovalResult = (data: unknown) =>
+  Schema.decodeUnknownResult(ApprovalSchema)(data);
+
+export const decodeApprovalSync = (data: unknown): Approval =>
+  Schema.decodeUnknownSync(ApprovalSchema)(data);
+
+export const decodeTranscriptResult = (data: unknown) =>
+  Schema.decodeUnknownResult(TranscriptSchema)(data);
+
+export const decodeTranscriptSync = (data: unknown): Transcript =>
+  Schema.decodeUnknownSync(TranscriptSchema)(data);
+
+export const decodeUsageResult = (data: unknown) =>
+  Schema.decodeUnknownResult(UsageSchema)(data);
+
+export const decodeUsageSync = (data: unknown): Usage =>
+  Schema.decodeUnknownSync(UsageSchema)(data);
+
+export const decodeBlockResult = (data: unknown) =>
+  Schema.decodeUnknownResult(BlockSchema)(data);
+
+export const decodeBlockSync = (data: unknown): Block =>
+  Schema.decodeUnknownSync(BlockSchema)(data);

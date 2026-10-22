@@ -31,8 +31,11 @@ export function bound(value: string, bytes: number, marker: string): string {
 }
 
 // Effect v4 Option variant: returns Option.some(truncated) if truncation occurred,
-// or Option.none() if the string fits comfortably within budget.
-export function boundOption(value: string, bytes: number, marker: string): Option.Option<string> {
+// or Option.none() if the string fits comfortably within budget without truncation.
+export function truncateOption(value: string, bytes: number, marker: string): Option.Option<string> {
   if (Buffer.byteLength(value) <= bytes) return Option.none();
   return Option.some(`${cut(value, bytes - Buffer.byteLength(marker))}${marker}`);
 }
+
+// Backwards-compatible alias for callers using boundOption
+export const boundOption = truncateOption;
