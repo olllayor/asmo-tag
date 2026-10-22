@@ -2,28 +2,26 @@
  * Effect v4 Core Domain Schemas & Validation
  *
  * Implements core data models using pure Effect v4 Schema and Result primitives.
- * Provides zero-runtime-dependency type decoding, encoding, and functional error handling.
+ * Provides Effect-backed type decoding, encoding, and functional error handling.
  */
 
 import { Schema, Effect } from "effect";
 
-declare module "effect/Schema" {
-  export type Type<S> = Schema.Type<S>;
-}
+type Type<S> = Schema.Schema.Type<S>;
 
 // Base primitives
 export const IdSchema = Schema.String.pipe(
   Schema.check(Schema.isBetweenLength(1, 128))
 );
-export type Id = Schema.Type<typeof IdSchema>;
+export type Id = Type<typeof IdSchema>;
 
 export const MicrosSchema = Schema.Int.pipe(
   Schema.check(Schema.isGreaterThanOrEqualTo(0))
 );
-export type Micros = Schema.Type<typeof MicrosSchema>;
+export type Micros = Type<typeof MicrosSchema>;
 
 export const RoleSchema = Schema.Literals(["owner", "manager", "member"]);
-export type Role = Schema.Type<typeof RoleSchema>;
+export type Role = Type<typeof RoleSchema>;
 
 // Scope definition
 export const ScopeKindSchema = Schema.Literals(["group", "dm", "workspace"]);
@@ -43,7 +41,7 @@ export const ScopeSchema = Schema.Struct({
   budgetMicros: MicrosSchema,
   captureBoundedAt: Schema.optional(Schema.NullOr(Schema.Finite)),
 });
-export type Scope = Schema.Type<typeof ScopeSchema>;
+export type Scope = Type<typeof ScopeSchema>;
 
 // Source definition
 export const SourceKindSchema = Schema.Literals(["message", "text_file", "tool"]);
@@ -57,7 +55,7 @@ export const SourceSchema = Schema.Struct({
   capturedAt: Schema.Finite,
   kind: SourceKindSchema,
 });
-export type Source = Schema.Type<typeof SourceSchema>;
+export type Source = Type<typeof SourceSchema>;
 
 // Memory definition
 export const MemoryStateSchema = Schema.Literals(["active", "candidate", "rejected", "invalidated"]);
@@ -72,7 +70,7 @@ export const MemorySchema = Schema.Struct({
   authorId: IdSchema,
   correctedByHuman: Schema.Boolean,
 });
-export type Memory = Schema.Type<typeof MemorySchema>;
+export type Memory = Type<typeof MemorySchema>;
 
 // Answer definition
 export const AnswerSchema = Schema.Struct({
@@ -80,7 +78,7 @@ export const AnswerSchema = Schema.Struct({
   sourceIds: Schema.Array(IdSchema),
   limitations: Schema.Array(Schema.String),
 });
-export type Answer = Schema.Type<typeof AnswerSchema>;
+export type Answer = Type<typeof AnswerSchema>;
 
 // Task definition
 export const TaskStateSchema = Schema.Literals([
@@ -95,7 +93,7 @@ export const TaskStateSchema = Schema.Literals([
   "failed",
   "canceled",
 ]);
-export type TaskState = Schema.Type<typeof TaskStateSchema>;
+export type TaskState = Type<typeof TaskStateSchema>;
 
 export const CompactionSchema = Schema.Struct({
   entries: Schema.Int.pipe(Schema.check(Schema.isGreaterThanOrEqualTo(0))),
@@ -120,7 +118,7 @@ export const TaskSchema = Schema.Struct({
   createdAt: Schema.Finite,
   compaction: Schema.optional(CompactionSchema),
 });
-export type Task = Schema.Type<typeof TaskSchema>;
+export type Task = Type<typeof TaskSchema>;
 
 // Transcript block definitions
 export const TextBlockSchema = Schema.Struct({
@@ -147,7 +145,7 @@ export const BlockSchema = Schema.Union([
   ToolUseBlockSchema,
   ToolResultBlockSchema,
 ]);
-export type Block = Schema.Type<typeof BlockSchema>;
+export type Block = Type<typeof BlockSchema>;
 
 export const TranscriptSchema = Schema.Struct({
   role: Schema.Literals(["user", "assistant"]),
@@ -162,7 +160,7 @@ export const TranscriptSchema = Schema.Struct({
     })
   ),
 });
-export type Transcript = Schema.Type<typeof TranscriptSchema>;
+export type Transcript = Type<typeof TranscriptSchema>;
 
 // Token usage
 export const UsageSchema = Schema.Struct({
@@ -175,7 +173,7 @@ export const UsageSchema = Schema.Struct({
   simulated: Schema.Boolean,
   pricingRevision: Schema.String,
 });
-export type Usage = Schema.Type<typeof UsageSchema>;
+export type Usage = Type<typeof UsageSchema>;
 
 // Turn
 export const TurnOutcomeSchema = Schema.Literals(["complete", "tools", "needs_input", "incomplete"]);
@@ -194,7 +192,7 @@ export const TurnSchema = Schema.Struct({
     })
   ),
 });
-export type Turn = Schema.Type<typeof TurnSchema>;
+export type Turn = Type<typeof TurnSchema>;
 
 // Approval definition
 export const ApprovalStateSchema = Schema.Literals(["pending", "approved", "denied", "invalidated", "expired"]);
@@ -208,7 +206,7 @@ export const ApprovalSchema = Schema.Struct({
   state: ApprovalStateSchema,
   decidedBy: Schema.NullOr(Schema.String),
 });
-export type Approval = Schema.Type<typeof ApprovalSchema>;
+export type Approval = Type<typeof ApprovalSchema>;
 
 // ============================================================================
 // Functional Decoder Primitives (Precompiled Point-Free Effect v4 Decoders)

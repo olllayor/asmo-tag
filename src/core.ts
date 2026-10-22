@@ -472,5 +472,3 @@ export function wallClockInstant(value: string, timeZone: string): number {
   return resolveWallClockInstant(wallAsUtc, timeZone);
 }
 
-// Export Effect v4 domain schemas and decoders
-export * as CoreEffect from "./core-effect.js";
