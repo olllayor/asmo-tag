@@ -2,6 +2,8 @@
 // numbers: a value the store writes and the adapter then re-cuts is rewritten on every turn,
 // and every rewrite invalidates the cached prefix.
 
+import { Option } from "effect";
+
 // Schema caps instructions and steers at 16,000 characters, which encodes to at most 48,000
 // bytes. The bound sits above that so it never fires for input the command layer accepted,
 // which keeps the prompt stable for real conversations.
@@ -26,4 +28,11 @@ export function cut(value: string, bytes: number): string {
 export function bound(value: string, bytes: number, marker: string): string {
   if (Buffer.byteLength(value) <= bytes) return value;
   return `${cut(value, bytes - Buffer.byteLength(marker))}${marker}`;
+}
+
+// Effect v4 Option variant: returns Option.some(truncated) if truncation occurred,
+// or Option.none() if the string fits comfortably within budget.
+export function boundOption(value: string, bytes: number, marker: string): Option.Option<string> {
+  if (Buffer.byteLength(value) <= bytes) return Option.none();
+  return Option.some(`${cut(value, bytes - Buffer.byteLength(marker))}${marker}`);
 }

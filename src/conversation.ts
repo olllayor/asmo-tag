@@ -1,9 +1,17 @@
+import { Option, Result } from "effect";
+
 export function greetingReply(text: string): string | null {
   const greeting = text.trim().replace(/^@[a-z0-9_]+\s+/i, "").replace(/\s+@[a-z0-9_]+$/i, "").replace(/[.!?]+$/, "").trim().toLowerCase();
   if (["hi", "hello", "hey"].includes(greeting)) return "Hi!";
   if (greeting === "salom") return "Salom!";
   if (["привет", "здравствуйте"].includes(greeting)) return "Привет!";
   return null;
+}
+
+// Effect v4 Option variant
+export function greetingReplyOption(text: string): Option.Option<string> {
+  const reply = greetingReply(text);
+  return reply !== null ? Option.some(reply) : Option.none();
 }
 
 export function contextCoverageLimitation(collectedSince: number): string {
@@ -18,4 +26,13 @@ export function conversationAnswer(text: string, limitations: string[], collecte
   const relevant = limitations.filter(item => item !== contextCoverageLimitation(collectedSince));
   const answer = text.trim().replace(/^Needs input:\s*/, "");
   return [answer || "I couldn't produce an answer. Please try again.", ...relevant].join("\n\n");
+}
+
+// Effect v4 Result variant
+export function conversationAnswerResult(
+  text: string,
+  limitations: string[],
+  collectedSince: number
+): Result.Result<string, never> {
+  return Result.succeed(conversationAnswer(text, limitations, collectedSince));
 }
