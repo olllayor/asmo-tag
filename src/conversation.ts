@@ -1,17 +1,9 @@
-import { Option } from "effect";
-
 export function greetingReply(text: string): string | null {
   const greeting = text.trim().replace(/^@[a-z0-9_]+\s+/i, "").replace(/\s+@[a-z0-9_]+$/i, "").replace(/[.!?]+$/, "").trim().toLowerCase();
   if (["hi", "hello", "hey"].includes(greeting)) return "Hi!";
   if (greeting === "salom") return "Salom!";
   if (["привет", "здравствуйте"].includes(greeting)) return "Привет!";
   return null;
-}
-
-// Effect v4 Option variant
-export function greetingReplyOption(text: string): Option.Option<string> {
-  const reply = greetingReply(text);
-  return reply !== null ? Option.some(reply) : Option.none();
 }
 
 export function contextCoverageLimitation(collectedSince: number): string {

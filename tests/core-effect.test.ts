@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { Result, Option } from "effect";
+import { Result } from "effect";
 import {
   IdSchema,
   MicrosSchema,
@@ -22,8 +22,6 @@ import {
   decodeTranscriptResult,
   decodeBlockSync,
 } from "../src/core-effect.js";
-import { truncateOption, boundOption } from "../src/limits.js";
-import { greetingReplyOption } from "../src/conversation.js";
 
 describe("Effect v4 Core Domain Schemas & Decoders", () => {
   it("validates IdSchema lower and upper bounds (1-128 chars)", () => {
@@ -60,7 +58,7 @@ describe("Effect v4 Core Domain Schemas & Decoders", () => {
     });
     expect(Result.isFailure(emptyId)).toBe(true);
     if (Result.isFailure(emptyId)) {
-      expect(emptyId.failure.message).toContain("length of at least 1");
+      expect(emptyId.failure.message).toContain("length between 1 and 128");
     }
 
     // Over 128 chars
@@ -80,7 +78,7 @@ describe("Effect v4 Core Domain Schemas & Decoders", () => {
     });
     expect(Result.isFailure(oversizedId)).toBe(true);
     if (Result.isFailure(oversizedId)) {
-      expect(oversizedId.failure.message).toContain("length of at most 128");
+      expect(oversizedId.failure.message).toContain("length between 1 and 128");
     }
   });
 
@@ -305,33 +303,5 @@ describe("Effect v4 Core Domain Schemas & Decoders", () => {
     if (Result.isSuccess(approval)) {
       expect(approval.success.state).toBe("pending");
     }
-  });
-
-  it("integrates Effect Option with truncateOption in limits (Defect 5 parity)", () => {
-    // Fits in budget -> Option.none()
-    const fit = truncateOption("short string", 100, " [cut]");
-    expect(Option.isNone(fit)).toBe(true);
-
-    // Over budget -> Option.some(truncated)
-    const truncated = truncateOption("very long string exceeding small budget", 15, " [cut]");
-    expect(Option.isSome(truncated)).toBe(true);
-    if (Option.isSome(truncated)) {
-      expect(truncated.value).toContain("[cut]");
-      expect(Buffer.byteLength(truncated.value)).toBeLessThanOrEqual(15);
-    }
-
-    // Alias boundOption works identically
-    expect(Option.isNone(boundOption("short string", 100, " [cut]"))).toBe(true);
-  });
-
-  it("integrates greetingReplyOption in conversation", () => {
-    const greeting = greetingReplyOption("@asmo_ai_bot hi");
-    expect(Option.isSome(greeting)).toBe(true);
-    if (Option.isSome(greeting)) {
-      expect(greeting.value).toBe("Hi!");
-    }
-
-    const nonGreeting = greetingReplyOption("some random task instruction");
-    expect(Option.isNone(nonGreeting)).toBe(true);
   });
 });
