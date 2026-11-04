@@ -174,7 +174,7 @@ importers:
         version: 1.46.0(supports-color@10.2.2)
       openai:
         specifier: 7.28.0
-        version: 7.28.0(undici@7.29.1)(ws@8.21.0)(zod@4.6.5)
+        version: 7.28.0(undici@7.29.1)(ws@8.21.0)(zod@4.6.6)
       react:
         specifier: 19.3.0
         version: 19.3.0
@@ -182,8 +182,8 @@ importers:
         specifier: 19.3.0
         version: 19.3.0(react@19.3.0)
       zod:
-        specifier: 4.6.5
-        version: 4.6.5
+        specifier: 4.6.6
+        version: 4.6.6
     devDependencies:
       '@types/node':
         specifier: ^22.0.0
@@ -1298,8 +1298,8 @@ packages:
   youch@4.1.0-beta.10:
     resolution: {integrity: sha512-rLfVLB4FgQneDr0dv1oddCVZmKjcJ6yX6mS4pU82Mq/Dt9a3cLZQ62pDBL4AUO+uVrCvtWz3ZFUL2HFAFJ/BXQ==}
 
-  zod@4.6.5:
-    resolution: {integrity: sha512-v5l/aFXZQeai4awLbOpSoHecE9UiMrnfx75tEXLjNonXVARxQ5mOeipTjROUchszUNCqnE+hqAMujRsRHsut2Q==}
+  zod@4.6.6:
+    resolution: {integrity: sha512-4UmzQUF5fxvfcYHlbjBmejU+w+hbDnWFx4aS8kBx7nPBHcO2SqPbpAG8snbdg+Xse4pRefR98hgjFgIMCI/UhA==}
 
 snapshots:
 
@@ -1850,11 +1850,11 @@ snapshots:
 
   obug@2.2.1: {}
 
-  openai@7.28.0(undici@7.29.1)(ws@8.21.0)(zod@4.6.5):
+  openai@7.28.0(undici@7.29.1)(ws@8.21.0)(zod@4.6.6):
     optionalDependencies:
       undici: 7.29.1
       ws: 8.21.0
-      zod: 4.6.5
+      zod: 4.6.6
 
   path-to-regexp@6.3.0: {}
 
@@ -2075,4 +2075,4 @@ snapshots:
       cookie: 1.1.1
       youch-core: 0.3.3
 
-  zod@4.6.5: {}
+  zod@4.6.6: {}
